@@ -50,9 +50,21 @@ impl BlockCache {
         let entry = match self.entries.get(&key) {
             Some(e) => e,
             None => {
-                // Fallback: try other verbosity levels (v2 is superset of v1)
-                let fallback = if verbosity == 1 { 2u8 } else { 1u8 };
-                match self.entries.get(&(hash.to_string(), fallback)) {
+                // Verbosity fallback is safe in ONE direction only. A verbosity-2
+                // response is a superset of verbosity-1, so a v1 request may be
+                // served from a cached v2 entry. The reverse is NOT safe: a v1
+                // response carries only txid strings (`.tx = ["<txid>", ...]`),
+                // not the full transaction objects a v2 caller expects. Serving a
+                // v1 entry for a v2 request returns a malformed block that breaks
+                // consumers (e.g. MPW's `.tx[] | { hex: .hex }` jq filter fails
+                // with "cannot index <txid> with hex"). v0 is raw hex, not JSON,
+                // so it never participates. Only a v1 request may fall back (→v2);
+                // any other miss must return None so the proxy fetches fresh.
+                if verbosity != 1 {
+                    self.misses.fetch_add(1, Ordering::Relaxed);
+                    return None;
+                }
+                match self.entries.get(&(hash.to_string(), 2u8)) {
                     Some(e) => e,
                     None => {
                         self.misses.fetch_add(1, Ordering::Relaxed);
@@ -264,5 +276,21 @@ mod tests {
         assert!(cache.get("abc", 1, 200).is_some());
         // v0 lookup: no fallback (v0 is hex, not JSON)
         assert!(cache.get("abc", 0, 200).is_none());
+    }
+
+    #[test]
+    fn v2_request_never_falls_back_to_v1() {
+        // Regression: a v1 entry (txid strings, not full tx objects) must NEVER
+        // satisfy a v2 request. The old bidirectional fallback served the v1
+        // entry for v2 lookups, returning a malformed block (`.tx` = txid
+        // strings) that broke `getblock ...,2` consumers (e.g. MPW's jq filter).
+        let mut cache = BlockCache::new(10);
+        cache.insert("def", 1, &make_block(101, "def"));
+
+        // v1 direct hit is fine.
+        assert!(cache.get("def", 1, 200).is_some());
+        // v2 must miss (→ None) so the proxy re-fetches a real v2 block from the
+        // node, rather than being served the v1 (string-tx) entry.
+        assert!(cache.get("def", 2, 200).is_none());
     }
 }
