@@ -2,6 +2,7 @@
 ///
 /// Connects to a PIVX full node, scans for Sapling transactions, and serves
 /// shield data to light wallets (MyPIVXWallet) over HTTP.
+mod addr_index;
 mod api;
 mod block_cache;
 mod cache;
@@ -252,6 +253,35 @@ fn find_fork_point_via_rpc(
     // Re-scan from last_shield + 1 forward.
     let _ = rpc; // RPC not needed for this conservative variant
     last_shield + 1
+}
+
+/// Directory with the Sapling proving parameters, if available.
+fn sapling_params_dir(config: &config::Config) -> Option<std::path::PathBuf> {
+    let dir = config
+        .sapling_params_dir
+        .clone()
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".pivx-params")))?;
+    let ok = ["sapling-output.params", "sapling-spend.params"]
+        .iter()
+        .all(|f| dir.join(f).is_file());
+    ok.then_some(dir)
+}
+
+/// `/sapling-output.params` + `/sapling-spend.params`, so light wallets
+/// can fetch the proving parameters from the same server.
+fn sapling_params_routes(dir: &std::path::Path) -> Router {
+    use axum::http::{header::CONTENT_ENCODING, HeaderValue};
+    use tower_http::services::ServeFile;
+    use tower_http::set_header::SetResponseHeaderLayer;
+    Router::new()
+        .route_service("/sapling-output.params", ServeFile::new(dir.join("sapling-output.params")))
+        .route_service("/sapling-spend.params", ServeFile::new(dir.join("sapling-spend.params")))
+        // Random-looking 50 MB files: tell the gzip layer to leave them alone.
+        .layer(SetResponseHeaderLayer::if_not_present(
+            CONTENT_ENCODING,
+            HeaderValue::from_static("identity"),
+        ))
 }
 
 /// Build the standard route set for a network.
@@ -771,6 +801,17 @@ fn poll_new_blocks(
     let _ = chain_height;
 }
 
+/// Open the address index, start its indexer thread and return its
+/// `/api/v2/*` routes. Exits the process if the index can't be opened
+/// (an operator who asked for it should notice).
+fn start_addr_index(label: &'static str, path: &str, rpc_url: &str, rpc_user: &str, rpc_pass: &str) -> Router {
+    let idx = addr_index::AddrIndex::open(label, path, rpc_url, rpc_user, rpc_pass)
+        .unwrap_or_else(|e| panic!("[{label}] address index failed to open: {e}"));
+    idx.spawn(rpc_url.to_string(), rpc_user.to_string(), rpc_pass.to_string());
+    eprintln!("  [{label}] Address index: enabled at /api/v2/");
+    addr_index::api::routes(idx)
+}
+
 #[tokio::main]
 async fn main() {
     let _ = dotenvy::dotenv();
@@ -814,7 +855,25 @@ async fn main() {
         mainnet_index_path,
     );
 
-    let mainnet_routes = build_routes(mainnet_state);
+    let params_dir = sapling_params_dir(&config);
+    match &params_dir {
+        Some(d) => eprintln!("  Sapling params: serving from {}", d.display()),
+        None => eprintln!("  Sapling params: not found (set SAPLING_PARAMS_DIR to serve them)"),
+    }
+
+    let mut mainnet_routes = build_routes(mainnet_state);
+    if let Some(d) = &params_dir {
+        mainnet_routes = mainnet_routes.merge(sapling_params_routes(d));
+    }
+    if config.addr_index {
+        mainnet_routes = mainnet_routes.merge(start_addr_index(
+            "mainnet",
+            &config.addr_index_path,
+            &config.rpc_url,
+            &config.rpc_user,
+            &config.rpc_pass,
+        ));
+    }
 
     // -- Router --
     let mut app = Router::new()
@@ -852,7 +911,19 @@ async fn main() {
                 testnet_index_path,
             );
 
-            let testnet_routes = build_routes(testnet_state);
+            let mut testnet_routes = build_routes(testnet_state);
+            if let Some(d) = &params_dir {
+                testnet_routes = testnet_routes.merge(sapling_params_routes(d));
+            }
+            if config.addr_index {
+                testnet_routes = testnet_routes.merge(start_addr_index(
+                    "testnet",
+                    &config.testnet_addr_index_path,
+                    testnet_url,
+                    testnet_user,
+                    testnet_pass,
+                ));
+            }
             app = app.nest("/testnet", testnet_routes);
             eprintln!("  Testnet: enabled at /testnet/");
         }

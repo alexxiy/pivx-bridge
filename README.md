@@ -78,6 +78,7 @@ All endpoints are served at both `/mainnet/...` and `/...` (without prefix).
 | `/mainnet/getshieldblocks` | GET | JSON array of shield block heights |
 | `/mainnet/sendrawtransaction` | POST | Broadcast raw transaction hex |
 | `/mainnet/address_index` | GET | SQLite address index (for MPW-Tauri) |
+| `/mainnet/sapling-output.params`, `/mainnet/sapling-spend.params` | GET | Sapling proving parameters for wallets that build shield transactions (served when found, see `SAPLING_PARAMS_DIR`) |
 
 ### RPC Proxy
 
@@ -86,6 +87,24 @@ All endpoints are served at both `/mainnet/...` and `/...` (without prefix).
 | `/mainnet/:method?params=a,b,c&filter=<jq>` | GET | Proxied RPC call with optional jq filtering |
 
 The proxy validates methods against a configurable whitelist. Parameters are automatically type-coerced (numbers, booleans, strings). The `filter` parameter uses the system `jq` binary for full compatibility.
+
+### Transparent Address Index (opt-in, `ADDR_INDEX=true`)
+
+A Blockbook-compatible subset of `/api/v2`, so light wallets get transparent history, balances and UTXOs from the bridge instead of a separate Blockbook. MyPIVXWallet's `ExplorerNetwork` works against it unchanged.
+
+| Route | Method | Description |
+|-------|--------|-------------|
+| `/mainnet/api/v2/api` | GET | Index status (`blockbook.inSync`, `backend.blocks`, `bestBlockHash`) |
+| `/mainnet/api/v2/address/{address}` | GET | Address balance + history (`page`, `pageSize`, `from`, `to`, `details=basic\|txids\|txs`) |
+| `/mainnet/api/v2/xpub/{xpub}` | GET | BIP44 account xpub, gap-limit walk of chains 0/1 (`gap`, `tokens=nonzero\|used\|derived`, `details=…\|tokens\|tokenBalances`) |
+| `/mainnet/api/v2/utxo/{address\|xpub}` | GET | Unspent outputs incl. mempool (`confirmed=true` to exclude); coinbase/coinstake outputs are flagged |
+| `/mainnet/api/v2/tx/{txid}` | GET | Transaction with resolved input addresses/values, `hex`, fees, shield value balance |
+| `/mainnet/api/v2/block-index/{height}` | GET | Block hash at height |
+| `/mainnet/api/v2/sendtx/` | POST / GET `{hex}` | Broadcast |
+
+Every address the node decodes is indexed — P2PKH, P2SH, P2PK, exchange (`EXM…`) and both the staker and owner of cold-stake (P2CS) outputs. Unconfirmed transactions are tracked from the node's mempool. Reorgs are rolled back exactly (block hashes and undo data for the last 1000 blocks are kept).
+
+The index lives in its own `addr_index.redb` (redb, pure Rust), is built by its own thread and never touches the shield stream. The first run indexes the whole chain from genesis; status is visible at `/api/v2/api`. The node needs `txindex=1` (PIVX's default) for transaction details.
 
 ### Stream Formats
 
@@ -136,6 +155,11 @@ src/
   index.rs      Binary search index with byte offsets (shield.json compat)
   api.rs        HTTP endpoints with in-memory buffer serving + block hash LRU cache
   proxy.rs      RPC proxy with system jq filtering + response timing
+  addr_index/   Transparent address index (opt-in)
+    store.rs    redb tables: outputs, per-address history/UTXOs/stats, undo
+    mod.rs      Indexer thread: parallel catch-up, reorg rollback, mempool
+    xpub.rs     BIP32 public derivation + P2PKH encoding for xpub queries
+    api.rs      Blockbook-compatible /api/v2 endpoints
 ```
 
 ## Configuration
@@ -152,6 +176,10 @@ All options support both CLI flags and environment variables:
 | `--sapling-height` | `SAPLING_HEIGHT` | `2700501` | Sapling activation block |
 | `--no-compression` | `NO_COMPRESSION` | `false` | Disable gzip (use behind nginx) |
 | `--allowed-rpcs` | `ALLOWED_RPCS` | (see below) | Comma-separated RPC whitelist |
+| `--addr-index` | `ADDR_INDEX` | `false` | Enable the transparent address index + `/api/v2` |
+| `--sapling-params-dir` | `SAPLING_PARAMS_DIR` | `$HOME/.pivx-params` | Directory with `sapling-{output,spend}.params` to serve |
+| `--addr-index-path` | `ADDR_INDEX_PATH` | `addr_index.redb` | Address index database (mainnet) |
+| `--testnet-addr-index-path` | `TESTNET_ADDR_INDEX_PATH` | `addr_index.testnet.redb` | Address index database (testnet) |
 
 Default allowed RPCs: `getblockcount`, `getblockhash`, `getblock`, `getrawtransaction`, `sendrawtransaction`, `getmasternodecount`, `listmasternodes`, `getbudgetprojection`, `getbudgetinfo`, `getbudgetvotes`
 

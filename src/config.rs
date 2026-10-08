@@ -44,6 +44,24 @@ pub struct Config {
     #[arg(long, env = "SAPLING_HEIGHT", default_value_t = 2_700_501)]
     pub sapling_height: u32,
 
+    /// Enable the transparent address index + Blockbook-compatible
+    /// `/api/v2/*` endpoints. The first run indexes the whole chain.
+    #[arg(long, env = "ADDR_INDEX")]
+    pub addr_index: bool,
+
+    /// Address index database path (mainnet)
+    #[arg(long, env = "ADDR_INDEX_PATH", default_value = "addr_index.redb")]
+    pub addr_index_path: String,
+
+    /// Address index database path (testnet)
+    #[arg(long, env = "TESTNET_ADDR_INDEX_PATH", default_value = "addr_index.testnet.redb")]
+    pub testnet_addr_index_path: String,
+
+    /// Directory holding sapling-output.params / sapling-spend.params to
+    /// serve to wallets (defaults to $HOME/.pivx-params when present)
+    #[arg(long, env = "SAPLING_PARAMS_DIR")]
+    pub sapling_params_dir: Option<String>,
+
     /// Disable gzip compression (use when behind nginx or another compressing proxy)
     #[arg(long, env = "NO_COMPRESSION")]
     pub no_compression: bool,

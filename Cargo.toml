@@ -9,7 +9,7 @@ license = "MIT"
 # HTTP server
 axum = "0.8"
 tokio = { version = "1", features = ["full"] }
-tower-http = { version = "0.6", features = ["cors", "compression-gzip"] }
+tower-http = { version = "0.6", features = ["cors", "compression-gzip", "fs", "set-header"] }
 
 # RPC client (blocking — used in spawn_blocking)
 ureq = { version = "2", features = ["json"] }
@@ -28,6 +28,13 @@ futures = "0.3"
 
 # Utilities
 sha2 = "0.10"
+
+# Transparent address index (Blockbook-compatible API)
+redb = "2"
+k256 = { version = "0.13", default-features = false, features = ["arithmetic", "std"] }
+hmac = "0.12"
+ripemd = "0.1"
+bs58 = { version = "0.5", features = ["check"] }
 
 # Inline jq filter — pure Rust, no process fork
 jaq-core = "3"
