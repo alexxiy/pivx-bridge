@@ -79,6 +79,14 @@ impl TxCache {
 /// Derived-address cache per xpub: chain -> addresses[index].
 pub type XpubCache = HashMap<String, [Vec<String>; 2]>;
 
+/// What `/api/v2/watch` waits on: indexed tip and mempool sequence.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct WatchState {
+    pub height: u32,
+    pub hash: String,
+    pub mempool_seq: u64,
+}
+
 pub struct AddrIndex {
     pub label: &'static str,
     pub store: Store,
@@ -90,6 +98,8 @@ pub struct AddrIndex {
     pub in_sync: AtomicBool,
     pub tx_cache: Mutex<TxCache>,
     pub xpub_cache: Mutex<XpubCache>,
+    /// Published after every indexer pass while in sync.
+    pub changes: tokio::sync::watch::Sender<WatchState>,
 }
 
 impl AddrIndex {
@@ -99,6 +109,11 @@ impl AddrIndex {
         let chain = info["chain"].as_str().unwrap_or("main").to_string();
         let store = Store::open(path)?;
         let tip = store.tip()?;
+        let initial = WatchState {
+            height: tip.unwrap_or(0),
+            hash: tip.and_then(|t| store.block_info(t).ok().flatten()).map(|(h, _)| h).unwrap_or_default(),
+            mempool_seq: 0,
+        };
         eprintln!(
             "  [{label}] Address index: {path} (chain={chain}, indexed tip={})",
             tip.map(|t| t.to_string()).unwrap_or_else(|| "none".into())
@@ -113,6 +128,7 @@ impl AddrIndex {
             in_sync: AtomicBool::new(false),
             tx_cache: Mutex::new(TxCache::new(20_000)),
             xpub_cache: Mutex::new(HashMap::new()),
+            changes: tokio::sync::watch::Sender::new(initial),
         }))
     }
 
@@ -137,6 +153,7 @@ impl AddrIndex {
                         if let Err(e) = idx.sync_mempool(&rpc) {
                             eprintln!("  [{}] addr-index mempool: {e}", idx.label);
                         }
+                        idx.publish_changes();
                     }
                     std::thread::sleep(Duration::from_secs(2));
                 }
@@ -297,6 +314,20 @@ impl AddrIndex {
             );
         }
         result
+    }
+
+    /// Wake `/api/v2/watch` waiters if the tip or mempool moved.
+    fn publish_changes(&self) {
+        let Some(height) = self.indexed_tip() else { return };
+        let hash = self.store.block_info(height).ok().flatten().map(|(h, _)| h).unwrap_or_default();
+        let state = WatchState { height, hash, mempool_seq: self.mempool.read().unwrap().seq() };
+        self.changes.send_if_modified(|s| {
+            if *s == state {
+                return false;
+            }
+            *s = state;
+            true
+        });
     }
 
     fn sync_mempool(&self, rpc: &RpcClient) -> Result<(), String> {

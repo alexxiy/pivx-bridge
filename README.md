@@ -101,8 +101,11 @@ A Blockbook-compatible subset of `/api/v2`, so light wallets get transparent his
 | `/mainnet/api/v2/tx/{txid}` | GET | Transaction with resolved input addresses/values, `hex`, fees, shield value balance |
 | `/mainnet/api/v2/block-index/{height}` | GET | Block hash at height |
 | `/mainnet/api/v2/sendtx/` | POST / GET `{hex}` | Broadcast |
+| `/mainnet/api/v2/watch` | POST | Long-poll for changes (bridge extension, see below) |
 
 Every address the node decodes is indexed — P2PKH, P2SH, P2PK, exchange (`EXM…`) and both the staker and owner of cold-stake (P2CS) outputs. Unconfirmed transactions are tracked from the node's mempool. Reorgs are rolled back exactly (block hashes and undo data for the last 1000 blocks are kept).
+
+`/api/v2/watch` lets wallets react within ~2 s instead of polling. POST a JSON body `{"height", "hash"?, "mempoolSeq"?, "addresses": [...], "timeout"?}`; the bridge answers as soon as a block other than `height`/`hash` is indexed or a mempool tx touching one of `addresses` arrives after `mempoolSeq`, otherwise after `timeout` seconds (default 25, max 120). The answer is `{height, hash, mempoolSeq, newBlock, txids, reset, changed}`; send its `height`, `hash` and `mempoolSeq` with the next call. `reset: true` means the bridge does not know the client's `mempoolSeq` (it restarted, or the client fell more than 10 000 mempool arrivals behind) and the client should do a full refresh. Omit `mempoolSeq` on the first call.
 
 The index lives in its own `addr_index.redb` (redb, pure Rust), is built by its own thread and never touches the shield stream. The first run indexes the whole chain from genesis; status is visible at `/api/v2/api`. The node needs `txindex=1` (PIVX's default) for transaction details.
 

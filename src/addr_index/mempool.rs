@@ -1,6 +1,6 @@
 //! In-memory mempool view for the address index: which unconfirmed
 //! txs touch which addresses, and which confirmed outputs they spend.
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use serde_json::Value;
 
@@ -38,7 +38,16 @@ pub struct Mempool {
     by_addr: HashMap<AddrHash, HashSet<Txid>>,
     /// Outpoints (txid, vout) spent by some mempool tx.
     spent: HashSet<(Txid, u32)>,
+    /// Bumped for every tx added; lets `/api/v2/watch` clients ask
+    /// "what arrived since N".
+    seq: u64,
+    /// Recent arrivals: (seq, txid, touched addresses), oldest first.
+    events: VecDeque<(u64, Txid, Vec<AddrHash>)>,
 }
+
+/// Arrival events kept for `/api/v2/watch`. A client further behind
+/// than this is told to resync.
+const MAX_EVENTS: usize = 10_000;
 
 impl Mempool {
     pub fn len(&self) -> usize {
@@ -55,6 +64,35 @@ impl Mempool {
 
     pub fn is_spent(&self, txid: &Txid, vout: u32) -> bool {
         self.spent.contains(&(*txid, vout))
+    }
+
+    pub fn seq(&self) -> u64 {
+        self.seq
+    }
+
+    /// Txids that arrived after `since` and touch one of `addrs`, plus
+    /// the current sequence number. `None` when `since` is ahead of us
+    /// (bridge restarted) or older than the kept events.
+    pub fn events_since(&self, since: u64, addrs: &HashSet<AddrHash>) -> (u64, Option<Vec<Txid>>) {
+        if since > self.seq {
+            return (self.seq, None);
+        }
+        if let Some((oldest, _, _)) = self.events.front() {
+            if since + 1 < *oldest {
+                return (self.seq, None);
+            }
+        } else if since < self.seq {
+            return (self.seq, None);
+        }
+        let txids = self
+            .events
+            .iter()
+            .rev()
+            .take_while(|(s, _, _)| *s > since)
+            .filter(|(_, _, touched)| touched.iter().any(|a| addrs.contains(a)))
+            .map(|(_, t, _)| *t)
+            .collect();
+        (self.seq, Some(txids))
     }
 
     /// Replace the tracked set with `current` (txids from getrawmempool).
@@ -164,6 +202,11 @@ impl Mempool {
         }
         for i in &tx.inputs {
             self.spent.insert((i.prev_txid, i.prev_vout));
+        }
+        self.seq += 1;
+        self.events.push_back((self.seq, tx.txid, tx.deltas.keys().copied().collect()));
+        if self.events.len() > MAX_EVENTS {
+            self.events.pop_front();
         }
         self.txs.insert(tx.txid, tx);
     }

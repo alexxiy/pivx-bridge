@@ -8,6 +8,7 @@
 //!   GET  /api/v2/tx/{txid}
 //!   GET  /api/v2/block-index/{height}
 //!   GET  /api/v2/sendtx/{hex}   POST /api/v2/sendtx/  (body = hex)
+//!   POST /api/v2/watch          (long-poll, bridge extension)
 use std::collections::HashSet;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -20,7 +21,7 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use super::store::{txid_from_hex, txid_to_hex, value_to_sats, Txid, FLAG_COINBASE, FLAG_COINSTAKE};
+use super::store::{addr_hash, txid_from_hex, txid_to_hex, value_to_sats, Txid, FLAG_COINBASE, FLAG_COINSTAKE};
 use super::xpub::{is_xpub, ExtendedPubKey};
 use super::AddrIndex;
 
@@ -42,6 +43,7 @@ pub fn routes(idx: Arc<AddrIndex>) -> Router {
         .route("/api/v2/sendtx/{hex}", get(send_tx_get))
         .route("/api/v2/sendtx/", post(send_tx_post))
         .route("/api/v2/sendtx", post(send_tx_post))
+        .route("/api/v2/watch", post(watch))
         .with_state(idx)
 }
 
@@ -617,4 +619,69 @@ async fn send_tx_get(State(idx): State<Arc<AddrIndex>>, Path(hex): Path<String>)
 
 async fn send_tx_post(State(idx): State<Arc<AddrIndex>>, body: String) -> ApiResult {
     blocking(move || broadcast(&idx, &body)).await
+}
+
+// ---------------------------------------------------------------------------
+// Long-poll (bridge extension, not part of Blockbook)
+// ---------------------------------------------------------------------------
+
+const WATCH_DEFAULT_SECS: u64 = 25;
+const WATCH_MAX_SECS: u64 = 120;
+const WATCH_MAX_ADDRESSES: usize = 10_000;
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct WatchRequest {
+    /// Tip the client knows; any other tip answers at once.
+    height: Option<u32>,
+    hash: Option<String>,
+    /// `mempoolSeq` from the previous answer; omit on the first call.
+    mempool_seq: Option<u64>,
+    /// Addresses whose new mempool txs should wake the client.
+    #[serde(default)]
+    addresses: Vec<String>,
+    timeout: Option<u64>,
+}
+
+/// `POST /api/v2/watch` — answers as soon as a block is indexed or a
+/// mempool tx touching one of `addresses` arrives, else after `timeout`
+/// seconds. Response: `{height, hash, mempoolSeq, newBlock, txids,
+/// reset, changed}`. `reset` means the client's `mempoolSeq` is unknown
+/// here (bridge restarted or client too far behind): refresh fully.
+async fn watch(State(idx): State<Arc<AddrIndex>>, body: Option<Json<WatchRequest>>) -> ApiResult {
+    let req = body.map(|b| b.0).unwrap_or_default();
+    if req.addresses.len() > WATCH_MAX_ADDRESSES {
+        return Err(bad(format!("too many addresses (max {WATCH_MAX_ADDRESSES})")));
+    }
+    let addrs: HashSet<_> = req.addresses.iter().map(|a| addr_hash(a)).collect();
+    let secs = req.timeout.unwrap_or(WATCH_DEFAULT_SECS).clamp(1, WATCH_MAX_SECS);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(secs);
+    let mut rx = idx.changes.subscribe();
+    let mut since = req.mempool_seq;
+    loop {
+        let state = rx.borrow_and_update().clone();
+        let new_block = req.height.is_some_and(|h| h != state.height)
+            || req.hash.as_deref().is_some_and(|h| h != state.hash);
+        let (seq, txids) = match since {
+            None => (idx.mempool.read().unwrap().seq(), Some(vec![])),
+            Some(s) => idx.mempool.read().unwrap().events_since(s, &addrs),
+        };
+        let reset = txids.is_none();
+        let txids = txids.unwrap_or_default();
+        let changed = new_block || reset || !txids.is_empty();
+        let timed_out = !changed
+            && !matches!(tokio::time::timeout_at(deadline, rx.changed()).await, Ok(Ok(())));
+        if changed || timed_out {
+            return Ok(Json(json!({
+                "height": state.height,
+                "hash": state.hash,
+                "mempoolSeq": seq,
+                "newBlock": new_block,
+                "txids": txids.iter().map(txid_to_hex).collect::<Vec<_>>(),
+                "reset": reset,
+                "changed": changed,
+            })));
+        }
+        since = Some(seq);
+    }
 }
