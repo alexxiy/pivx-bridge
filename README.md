@@ -184,7 +184,7 @@ All options support both CLI flags and environment variables:
 | `--addr-index-path` | `ADDR_INDEX_PATH` | `addr_index.redb` | Address index database (mainnet) |
 | `--testnet-addr-index-path` | `TESTNET_ADDR_INDEX_PATH` | `addr_index.testnet.redb` | Address index database (testnet) |
 
-Default allowed RPCs: `getblockcount`, `getblockhash`, `getblock`, `getrawtransaction`, `sendrawtransaction`, `getmasternodecount`, `listmasternodes`, `relaymasternodebroadcast`, `getnetworkinfo`, `getbudgetprojection`, `getbudgetinfo`, `getbudgetvotes`, `mnbudgetrawvote`
+Default allowed RPCs: `getblockcount`, `getblockhash`, `getblock`, `getrawtransaction`, `sendrawtransaction`, `getmasternodecount`, `listmasternodes`, `relaymasternodebroadcast`, `getnetworkinfo`, `getbudgetprojection`, `getbudgetinfo`, `getbudgetvotes`, `mnbudgetrawvote`, `submitbudget`
 
 ## Persistence
 
