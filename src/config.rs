@@ -37,7 +37,7 @@ pub struct Config {
     pub port: u16,
 
     /// Comma-separated list of allowed RPC methods for the proxy
-    #[arg(long, env = "ALLOWED_RPCS", default_value = "getblockcount,getblockhash,getblock,getrawtransaction,sendrawtransaction,getmasternodecount,listmasternodes,relaymasternodebroadcast,getnetworkinfo,getbudgetprojection,getbudgetinfo,getbudgetvotes")]
+    #[arg(long, env = "ALLOWED_RPCS", default_value = "getblockcount,getblockhash,getblock,getrawtransaction,sendrawtransaction,getmasternodecount,listmasternodes,relaymasternodebroadcast,getnetworkinfo,getbudgetprojection,getbudgetinfo,getbudgetvotes,mnbudgetrawvote")]
     pub allowed_rpcs: String,
 
     /// Sapling activation height (mainnet)

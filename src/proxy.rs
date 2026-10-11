@@ -156,9 +156,17 @@ pub fn log_timing(start: std::time::Instant, label: &str) {
 /// Parse comma-separated params with PivxNodeController-style type coercion.
 ///
 /// Each param is tried as: integer → float → boolean → string.
+///
+/// A JSON array (`[...]`) is taken as is, for values that contain commas
+/// (e.g. budget proposal names) or need an exact type.
 fn parse_params(raw: &str) -> Vec<Value> {
     if raw.is_empty() {
         return Vec::new();
+    }
+    if raw.trim_start().starts_with('[') {
+        if let Ok(Value::Array(values)) = serde_json::from_str::<Value>(raw) {
+            return values;
+        }
     }
 
     raw.split(',')
@@ -261,6 +269,21 @@ mod tests {
     #[test]
     fn parse_params_empty() {
         assert_eq!(parse_params(""), Vec::<Value>::new());
+    }
+
+    #[test]
+    fn parse_params_json_array() {
+        let params = parse_params(r#"["Name, with comma", 1, "042"]"#);
+        assert_eq!(
+            params,
+            vec![
+                Value::String("Name, with comma".into()),
+                Value::Number(1.into()),
+                Value::String("042".into()),
+            ]
+        );
+        // Not valid JSON: plain comma splitting.
+        assert_eq!(parse_params("[a,b").len(), 2);
     }
 
     #[test]
