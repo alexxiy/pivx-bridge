@@ -1,57 +1,39 @@
 /// HTTP API — axum endpoints for the PIVX bridge.
 ///
-/// All routes are prefixed with `/mainnet/` for PivxNodeController compatibility.
+/// All routes are also served under `/mainnet/` for PivxNodeController
+/// compatibility.
+use std::io::{Read, Seek, SeekFrom};
 use std::sync::atomic::AtomicU32;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
+use axum::body::{Body, Bytes};
 use axum::extract::{Query, State};
-use axum::http::{HeaderValue, StatusCode};
+use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::Response;
 use axum::Json;
 use serde::Deserialize;
-use tokio::sync::{Mutex, RwLock};
 
 use crate::block_cache::BlockCache;
-use crate::index::ShieldIndex;
+use crate::proxy::JqPolicy;
 use crate::rpc::RpcClient;
+use crate::shield_store::ShieldStore;
+use crate::stream;
 
 /// Shared application state.
 pub struct AppState {
+    pub label: &'static str,
     pub rpc: RpcClient,
-    pub index: RwLock<ShieldIndex>,
-    pub cache_file: Mutex<std::fs::File>,
-    /// In-memory shield buffer — the entire shield.bin held in RAM.
-    /// Requests serve slices directly from this buffer (zero disk I/O).
-    pub shield_buffer: RwLock<Vec<u8>>,
+    /// shield.bin + its index; shield data is streamed from disk.
+    pub store: ShieldStore,
     pub allowed_rpcs: Vec<String>,
-    /// Last chain height fully scanned (not just last shield block).
-    pub last_scanned_height: RwLock<u32>,
-    /// Hash of the block at `last_scanned_height`. Persisted alongside
-    /// the cursor (in `shield_cursor.json`) so reorgs that span a
-    /// process restart are detectable: on startup, fetch the hash at
-    /// `last_scanned_height` from PIVX core and compare against this.
-    /// Without this, the in-memory `block_cache` starts empty after
-    /// every restart and the first reorg is silently missed.
-    pub last_scanned_hash: RwLock<String>,
     /// LRU cache: height → block hash. Eliminates redundant getblockhash RPCs.
     pub hash_cache: RwLock<HashCache>,
     /// Block JSON cache: `(hash, verbosity)` → stripped response.
     /// Eliminates repeated `getblock` RPCs for the same blocks.
-    pub block_cache: std::sync::RwLock<BlockCache>,
-    /// Current chain height — updated by ZMQ/polling, used for rehydration.
+    pub block_cache: RwLock<BlockCache>,
+    /// Node tip as last seen by the shield indexer.
     pub chain_height: AtomicU32,
-    /// True when ZMQ is connected and receiving blocks. Polling is disabled.
-    pub zmq_active: std::sync::atomic::AtomicBool,
-    /// Mutual-exclusion gate on `index_new_blocks`. When true, another
-    /// indexing pass is in flight; concurrent callers return early to
-    /// prevent double-appending the same block(s) into the shield stream
-    /// (the classic ZMQ+poll race that produced duplicate blocks on
-    /// rpc.pivxla.bz — see PIVX-Labs/pivx-bridge#1).
-    pub indexing: std::sync::atomic::AtomicBool,
-    /// Path to the scan-cursor sidecar (`shield_cursor.json` or
-    /// `shield_cursor.testnet.json`). Saved atomically alongside the
-    /// index after every successful append + reorg.
-    pub cursor_path: String,
+    pub jq: JqPolicy,
 }
 
 /// Fixed-size LRU cache for block height → hash mappings.
@@ -75,7 +57,8 @@ impl HashCache {
     }
 
     pub fn insert(&mut self, height: u32, hash: String) {
-        if self.entries.contains_key(&height) {
+        if let Some(old) = self.entries.get_mut(&height) {
+            *old = hash;
             return;
         }
         if self.entries.len() >= self.capacity {
@@ -86,6 +69,27 @@ impl HashCache {
         self.entries.insert(height, hash);
         self.order.push_back(height);
     }
+
+    /// Forget heights at or above `fork` (they were reorganised away).
+    pub fn invalidate_from(&mut self, fork: u32) {
+        self.entries.retain(|&h, _| h < fork);
+        self.order.retain(|&h| h < fork);
+    }
+}
+
+/// Run blocking work (RPC, disk) off the async workers.
+pub async fn blocking<T, F>(f: F) -> Result<T, (StatusCode, String)>
+where
+    F: FnOnce() -> Result<T, (StatusCode, String)> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+}
+
+fn internal(e: String) -> (StatusCode, String) {
+    (StatusCode::INTERNAL_SERVER_ERROR, e)
 }
 
 // ---------------------------------------------------------------------------
@@ -109,7 +113,7 @@ pub enum StreamFormat {
 }
 
 // ---------------------------------------------------------------------------
-// GET /mainnet/getshielddata?startBlock=N&format=...
+// GET /getshielddata?startBlock=N&format=...
 // ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
@@ -120,78 +124,111 @@ pub struct ShieldDataQuery {
     pub format: StreamFormat,
 }
 
-/// Build a binary response with X-Content-Length header (PivxNodeController compat).
-fn build_binary_response(data: Vec<u8>) -> Response {
-    let len = data.len();
-    let mut resp = Response::new(axum::body::Body::from(data));
-    resp.headers_mut().insert("Content-Type", HeaderValue::from_static("application/octet-stream"));
-    resp.headers_mut().insert("X-Content-Length", HeaderValue::from(len as u64));
+/// Bytes read from shield.bin per step while streaming.
+const CHUNK: u64 = 1 << 20;
+
+/// A binary response of `len` bytes (also in X-Content-Length, as
+/// PivxNodeController sends it).
+fn binary_response(body: Body, len: u64) -> Response {
+    let mut resp = Response::new(body);
+    let headers = resp.headers_mut();
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/octet-stream"));
+    headers.insert(header::CONTENT_LENGTH, HeaderValue::from(len));
+    headers.insert("X-Content-Length", HeaderValue::from(len));
     resp
 }
 
-/// Serve shield data as a binary stream.
+struct StreamReader {
+    state: Arc<AppState>,
+    file: Option<std::fs::File>,
+    /// Remaining PIVX-compat bytes to read.
+    left: u64,
+    format: StreamFormat,
+    generation: u64,
+    /// Compact formats: bytes of a block not yet complete.
+    carry: Vec<u8>,
+}
+
+impl StreamReader {
+    async fn next_chunk(mut self) -> Option<(std::io::Result<Bytes>, Option<Self>)> {
+        if self.left == 0 {
+            return None;
+        }
+        let n = self.left.min(CHUNK) as usize;
+        let mut file = self.file.take()?;
+        let read = tokio::task::spawn_blocking(move || {
+            let mut buf = vec![0u8; n];
+            file.read_exact(&mut buf).map(|_| (file, buf))
+        })
+        .await
+        .map_err(std::io::Error::other)
+        .and_then(|r| r);
+        let (file, buf) = match read {
+            Ok(v) => v,
+            Err(e) => return Some((Err(e), None)),
+        };
+        // A reorg cut shield.bin while we read: these bytes may be stale.
+        if self.state.store.generation() != self.generation {
+            return Some((Err(std::io::Error::other("shield data changed (chain reorganisation), retry")), None));
+        }
+        self.file = Some(file);
+        self.left -= n as u64;
+        let out = match self.format {
+            StreamFormat::PivxCompat => Bytes::from(buf),
+            format => {
+                self.carry.extend_from_slice(&buf);
+                let complete = stream::complete_blocks_len(&self.carry);
+                let out = stream::pivxcompat_to_compact(&self.carry[..complete], format);
+                self.carry.drain(..complete);
+                Bytes::from(out)
+            }
+        };
+        Some((Ok(out), Some(self)))
+    }
+}
+
+/// Serve shield data from `startBlock` on, streamed from shield.bin.
 ///
-/// For the default PIVX-compat format, serves from the shield.bin cache.
-/// For compact formats, re-fetches from the node and encodes on-the-fly.
+/// Compact formats are derived block by block from the PIVX-compat bytes.
 pub async fn get_shield_data(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ShieldDataQuery>,
 ) -> Result<Response, (StatusCode, String)> {
     let start = query.start_block.unwrap_or(0);
     let format = query.format;
-    let timer = std::time::Instant::now();
-
-    // For PIVX-compat format, serve directly from in-memory buffer
-    if format == StreamFormat::PivxCompat {
-        let offset = {
-            let index = state.index.read().await;
-            match index.offset_for_height(start) {
-                Some(o) => o as usize,
-                None => return Ok(build_binary_response(Vec::new())),
-            }
-        };
-
-        let buffer = state.shield_buffer.read().await;
-        if offset >= buffer.len() {
-            return Ok(build_binary_response(Vec::new()));
-        }
-
-        // Single allocation: copy the slice into the response
-        let data = buffer[offset..].to_vec();
-        drop(buffer); // release read lock before sending
-        crate::proxy::log_timing(timer, "getshielddata");
-        return Ok(build_binary_response(data));
+    let snapshot = state.store.snapshot();
+    let from = state.store.offsets_from(start).map_err(internal)?;
+    let Some(from) = from else {
+        return Ok(binary_response(Body::empty(), 0));
+    };
+    let pivx_len = snapshot.lengths.pivx.saturating_sub(from.pivx);
+    let out_len = snapshot.lengths.of(format).saturating_sub(from.of(format));
+    if pivx_len == 0 {
+        return Ok(binary_response(Body::empty(), 0));
     }
 
-    // Compact/CompactPlus: derive from the PivxCompat buffer by parsing
-    // raw txs and extracting compact fields. Zero RPC, pure CPU.
-    let offset = {
-        let index = state.index.read().await;
-        match index.offset_for_height(start) {
-            Some(o) => o as usize,
-            None => return Ok(build_binary_response(Vec::new())),
-        }
+    let s = state.clone();
+    let file = blocking(move || {
+        let mut f = s.store.open_reader().map_err(|e| internal(e.to_string()))?;
+        f.seek(SeekFrom::Start(from.pivx)).map_err(|e| internal(e.to_string()))?;
+        Ok(f)
+    })
+    .await?;
+
+    let reader = StreamReader {
+        state,
+        file: Some(file),
+        left: pivx_len,
+        format,
+        generation: snapshot.generation,
+        carry: Vec::new(),
     };
-
-    let buffer = state.shield_buffer.read().await;
-    if offset >= buffer.len() {
-        return Ok(build_binary_response(Vec::new()));
-    }
-
-    let data = pivxcompat_to_compact(&buffer[offset..], format);
-    drop(buffer);
-
-    let label = if format == StreamFormat::Compact {
-        "getshielddata (buffer→compact)"
-    } else {
-        "getshielddata (buffer→compact+)"
-    };
-    crate::proxy::log_timing(timer, label);
-    Ok(build_binary_response(data))
+    let body = Body::from_stream(futures::stream::unfold(Some(reader), |r| async move { r?.next_chunk().await }));
+    Ok(binary_response(body, out_len))
 }
 
 // ---------------------------------------------------------------------------
-// GET /mainnet/getshielddatalength?startBlock=N&endBlock=M
+// GET /getshielddatalength?startBlock=N&endBlock=M
 // ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
@@ -204,184 +241,52 @@ pub struct ShieldDataLengthQuery {
     pub format: StreamFormat,
 }
 
-/// Return the byte count of shield data between two block heights.
-///
-/// Accepts an optional `format` parameter to return the accurate size
-/// for compact or compact+ streams (derived from the PivxCompat buffer).
-/// Used by MPW for sync progress bars.
+/// Byte count of the shield data between two block heights (inclusive),
+/// in the requested format. Used by MPW for sync progress bars.
 pub async fn get_shield_data_length(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ShieldDataLengthQuery>,
 ) -> Result<String, (StatusCode, String)> {
     let start = query.start_block.unwrap_or(0);
     let end = query.end_block.unwrap_or(u32::MAX);
-    let buffer = state.shield_buffer.read().await;
-    let buffer_len = buffer.len() as u64;
-
-    let length = if query.format == StreamFormat::PivxCompat {
-        let index = state.index.read().await;
-        index.byte_length_between(start, end, buffer_len)
-    } else {
-        // Compute exact size by deriving the compact stream for the range
-        let index = state.index.read().await;
-        let start_off = index.offset_for_height(start).unwrap_or(buffer_len) as usize;
-        let end_off = index.entries.iter()
-            .find(|e| e.block > end)
-            .map(|e| e.i as usize)
-            .unwrap_or(buffer.len());
-        drop(index);
-
-        if start_off >= buffer.len() || start_off >= end_off {
-            0
-        } else {
-            pivxcompat_to_compact(&buffer[start_off..end_off], query.format).len() as u64
+    let snapshot = state.store.snapshot();
+    let length = match state.store.offsets_from(start).map_err(internal)? {
+        Some(from) if start <= end => {
+            let to = state.store.offsets_after(end, &snapshot).map_err(internal)?;
+            to.of(query.format).saturating_sub(from.of(query.format))
         }
+        _ => 0,
     };
-
     Ok(length.to_string())
 }
 
-/// Transform a PivxCompat (0x03) buffer into Compact (0x04) or CompactPlus (0x05).
-///
-/// Walks the raw tx packets, parses Sapling fields via `parse_sapling_tx`,
-/// and re-encodes as compact packets. Block footers (9 bytes with time) become
-/// compact headers (5 bytes, height only, before txs).
-fn pivxcompat_to_compact(data: &[u8], format: StreamFormat) -> Vec<u8> {
-    use crate::scanner;
-
-    let mut out = Vec::with_capacity(data.len() / 2); // compact is smaller
-    let mut pos = 0;
-    let mut pending_txs: Vec<Vec<u8>> = Vec::new();
-
-    while pos + 4 <= data.len() {
-        let pkt_len = u32::from_le_bytes([data[pos], data[pos+1], data[pos+2], data[pos+3]]) as usize;
-        let pkt_end = pos + 4 + pkt_len;
-        if pkt_end > data.len() || pkt_len == 0 { break; }
-
-        let pkt_type = data[pos + 4];
-
-        if pkt_type == 0x5d && pkt_len == 9 {
-            // Block footer → emit compact header + compact txs
-            let height = u32::from_le_bytes([data[pos+5], data[pos+6], data[pos+7], data[pos+8]]);
-
-            // Compact block header (5 bytes)
-            out.extend(5u32.to_le_bytes());
-            out.push(0x5d);
-            out.extend(height.to_le_bytes());
-
-            // Encode each raw tx as compact
-            for raw_tx in &pending_txs {
-                if let Ok(Some(compact)) = scanner::parse_sapling_tx(raw_tx) {
-                    encode_compact_packet(&mut out, &compact, format);
-                }
-            }
-            pending_txs.clear();
-        } else {
-            // Raw tx (type byte is first byte of the tx = 0x03 for v3)
-            pending_txs.push(data[pos + 4..pkt_end].to_vec());
-        }
-
-        pos = pkt_end;
-    }
-
-    out
-}
-
-/// Encode a single compact or compact+ tx packet.
-fn encode_compact_packet(out: &mut Vec<u8>, compact: &crate::scanner::CompactTx, format: StreamFormat) {
-    const ENC_CT: usize = 580;
-    const OUT_CT: usize = 80;
-
-    let (pkt_type, output_size) = match format {
-        StreamFormat::Compact => (0x04u8, 32 + 32 + 32 + ENC_CT + OUT_CT), // cv+cmu+epk+enc+out
-        StreamFormat::CompactPlus => (0x05u8, 32 + 32 + ENC_CT),           // cmu+epk+enc
-        _ => unreachable!(),
-    };
-
-    // Build the payload first, then prefix its exact length. The spend/output
-    // counts are CompactSize varints (not single bytes), so the header size is
-    // variable — measuring the built payload keeps the length prefix correct
-    // regardless of count size. (A previous u8 count silently truncated for
-    // txs with >255 spends/outputs, corrupting the stream.)
-    let cap = 1 + 9 + 9 + compact.nullifiers.len() * 32 + compact.outputs.len() * output_size;
-    let mut payload = Vec::with_capacity(cap);
-    payload.push(pkt_type);
-    crate::stream::write_compact_size(&mut payload, compact.nullifiers.len());
-    crate::stream::write_compact_size(&mut payload, compact.outputs.len());
-
-    for nf in &compact.nullifiers {
-        payload.extend_from_slice(nf);
-    }
-
-    for o in &compact.outputs {
-        if format == StreamFormat::Compact {
-            payload.extend_from_slice(&o.cv);
-        }
-        payload.extend_from_slice(&o.cmu);
-        payload.extend_from_slice(&o.epk);
-        payload.extend_from_slice(&o.enc_ciphertext);
-        if format == StreamFormat::Compact {
-            payload.extend_from_slice(&o.out_ciphertext);
-        }
-    }
-
-    out.extend((payload.len() as u32).to_le_bytes());
-    out.extend_from_slice(&payload);
-}
-
 // ---------------------------------------------------------------------------
-// GET /mainnet/getblockcount
+// GET /getblockcount
 // ---------------------------------------------------------------------------
 
 /// Return the current block height from the node.
-pub async fn get_block_count(
-    State(state): State<Arc<AppState>>,
-) -> Result<String, (StatusCode, String)> {
-    let count = state
-        .rpc
-        .get_block_count()
-        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("node error: {e}")))?;
-    Ok(count.to_string())
+pub async fn get_block_count(State(state): State<Arc<AppState>>) -> Result<String, (StatusCode, String)> {
+    blocking(move || {
+        state
+            .rpc
+            .get_block_count()
+            .map(|c| c.to_string())
+            .map_err(|e| (StatusCode::BAD_GATEWAY, format!("node error: {e}")))
+    })
+    .await
 }
 
 // ---------------------------------------------------------------------------
-// GET /mainnet/getshieldblocks
+// GET /getshieldblocks
 // ---------------------------------------------------------------------------
 
 /// Return a JSON array of all shield block heights.
-pub async fn get_shield_blocks(
-    State(state): State<Arc<AppState>>,
-) -> Json<Vec<u32>> {
-    let index = state.index.read().await;
-    Json(index.shield_heights.clone())
+pub async fn get_shield_blocks(State(state): State<Arc<AppState>>) -> Result<Json<Vec<u32>>, (StatusCode, String)> {
+    blocking(move || state.store.heights().map(Json).map_err(internal)).await
 }
 
 // ---------------------------------------------------------------------------
-// POST /mainnet/sendrawtransaction (body = hex string)
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// GET /mainnet/address_index
-// ---------------------------------------------------------------------------
-
-/// Serve the address index SQLite file (used by MPW-Tauri for bootstrap).
-pub async fn get_address_index() -> Result<Response, (StatusCode, String)> {
-    let path = "address_index.sqlite";
-    let data = tokio::fs::read(path)
-        .await
-        .map_err(|e| (StatusCode::NOT_FOUND, format!("address index not available: {e}")))?;
-
-    let mut resp = Response::new(axum::body::Body::from(data));
-    resp.headers_mut().insert("Content-Type", HeaderValue::from_static("application/octet-stream"));
-    resp.headers_mut().insert(
-        "Content-Disposition",
-        HeaderValue::from_static("attachment; filename=\"address_index.sqlite\""),
-    );
-    Ok(resp)
-}
-
-// ---------------------------------------------------------------------------
-// POST /mainnet/sendrawtransaction (body = hex string)
+// POST /sendrawtransaction (body = hex string)
 // ---------------------------------------------------------------------------
 
 /// Broadcast a raw transaction to the network.
@@ -389,102 +294,20 @@ pub async fn send_raw_transaction(
     State(state): State<Arc<AppState>>,
     body: String,
 ) -> Result<String, (StatusCode, String)> {
-    let hex = body.trim();
-    if hex.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "empty transaction hex".into()));
-    }
-    if hex.len() > 10_000_000 {
-        return Err((StatusCode::PAYLOAD_TOO_LARGE, "transaction too large".into()));
+    let hex = body.trim().to_string();
+    if hex.is_empty() || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err((StatusCode::BAD_REQUEST, "invalid transaction hex".into()));
     }
     eprintln!("  [broadcast] Received tx hex ({} bytes)", hex.len());
-
-    match state.rpc.send_raw_transaction(hex) {
+    blocking(move || match state.rpc.send_raw_transaction(&hex) {
         Ok(txid) => {
             eprintln!("  [broadcast] Success: {txid}");
             Ok(txid)
         }
         Err(e) => {
-            let msg = e.to_string();
-            eprintln!("  [broadcast] FAILED: {msg}");
-            Err((StatusCode::BAD_REQUEST, msg))
+            eprintln!("  [broadcast] FAILED: {e}");
+            Err((StatusCode::BAD_REQUEST, e))
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Golden vector: first 3 blocks of real PIVX shield.bin (mainnet).
-    const SHIELD_SLICE: &[u8] = include_bytes!("../tests/shield_slice.bin");
-
-    fn parse_block_heights(data: &[u8], footer_len: usize) -> Vec<u32> {
-        let mut heights = Vec::new();
-        let mut pos = 0;
-        while pos + 4 <= data.len() {
-            let pkt_len = u32::from_le_bytes([data[pos], data[pos+1], data[pos+2], data[pos+3]]) as usize;
-            let pkt_end = pos + 4 + pkt_len;
-            if pkt_end > data.len() || pkt_len == 0 { break; }
-            if data[pos + 4] == 0x5d && pkt_len == footer_len {
-                heights.push(u32::from_le_bytes([data[pos+5], data[pos+6], data[pos+7], data[pos+8]]));
-            }
-            pos = pkt_end;
-        }
-        heights
-    }
-
-    fn count_tx_packets(data: &[u8], pkt_type: u8) -> usize {
-        let mut count = 0;
-        let mut pos = 0;
-        while pos + 4 <= data.len() {
-            let pkt_len = u32::from_le_bytes([data[pos], data[pos+1], data[pos+2], data[pos+3]]) as usize;
-            let pkt_end = pos + 4 + pkt_len;
-            if pkt_end > data.len() || pkt_len == 0 { break; }
-            if data[pos + 4] == pkt_type { count += 1; }
-            pos = pkt_end;
-        }
-        count
-    }
-
-    #[test]
-    fn pivxcompat_to_compact_golden_vector() {
-        let compact = pivxcompat_to_compact(SHIELD_SLICE, StreamFormat::Compact);
-
-        // Source has 3 blocks with PivxCompat footers (9 bytes)
-        let src_heights = parse_block_heights(SHIELD_SLICE, 9);
-        assert_eq!(src_heights.len(), 3, "golden vector should have 3 blocks");
-
-        // Compact output should have 3 blocks with compact headers (5 bytes)
-        let dst_heights = parse_block_heights(&compact, 5);
-        assert_eq!(dst_heights, src_heights, "compact must preserve block heights");
-
-        // Compact should have 0x04 tx packets, not 0x03
-        assert_eq!(count_tx_packets(SHIELD_SLICE, 0x03), count_tx_packets(&compact, 0x04),
-            "compact must have same number of txs as source");
-        assert_eq!(count_tx_packets(&compact, 0x03), 0,
-            "compact must not contain raw tx packets");
-
-        // Compact should be smaller
-        assert!(compact.len() < SHIELD_SLICE.len(),
-            "compact ({}) should be smaller than pivxcompat ({})", compact.len(), SHIELD_SLICE.len());
-    }
-
-    #[test]
-    fn pivxcompat_to_compactplus_golden_vector() {
-        let compact = pivxcompat_to_compact(SHIELD_SLICE, StreamFormat::Compact);
-        let compact_plus = pivxcompat_to_compact(SHIELD_SLICE, StreamFormat::CompactPlus);
-
-        // CompactPlus should be even smaller (strips cv + out_ciphertext)
-        assert!(compact_plus.len() < compact.len(),
-            "compact+ ({}) should be smaller than compact ({})", compact_plus.len(), compact.len());
-
-        // Same block heights
-        let cp_heights = parse_block_heights(&compact_plus, 5);
-        let src_heights = parse_block_heights(SHIELD_SLICE, 9);
-        assert_eq!(cp_heights, src_heights);
-
-        // 0x05 packets
-        assert_eq!(count_tx_packets(&compact_plus, 0x05), count_tx_packets(SHIELD_SLICE, 0x03));
-        assert_eq!(count_tx_packets(&compact_plus, 0x04), 0);
-    }
+    })
+    .await
 }

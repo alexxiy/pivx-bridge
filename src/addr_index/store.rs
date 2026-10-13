@@ -20,7 +20,7 @@
 //!   UNDO       height                                      → see `UndoRecord`
 use std::collections::HashMap;
 
-use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition, WriteTransaction};
+use redb::{Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition, WriteTransaction};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -270,7 +270,8 @@ fn e<E: std::fmt::Display>(err: E) -> String {
 
 impl Store {
     pub fn open(path: &str) -> StoreResult<Self> {
-        let db = Database::create(path).map_err(e)?;
+        let db = Database::create(path)
+            .map_err(|err| format!("{path}: {err} — delete it to rebuild the index"))?;
         let store = Self { db };
         // Create all tables up front so read transactions never fail
         // with TableDoesNotExist on a fresh database.
@@ -352,8 +353,8 @@ impl Store {
         for (txpos, tx) in txs.iter().enumerate() {
             let txpos = txpos as u32;
             let txid = txid_from_hex(tx["txid"].as_str().unwrap_or("")).ok_or("bad txid")?;
-            let vin = tx["vin"].as_array().cloned().unwrap_or_default();
-            let vout = tx["vout"].as_array().cloned().unwrap_or_default();
+            let vin: &[Value] = tx["vin"].as_array().map(|a| a.as_slice()).unwrap_or_default();
+            let vout: &[Value] = tx["vout"].as_array().map(|a| a.as_slice()).unwrap_or_default();
             let is_coinbase = vin.first().map(|v| v.get("coinbase").is_some_and(|c| !c.is_null())).unwrap_or(false);
             let is_coinstake = !is_coinbase
                 && !vin.is_empty()
@@ -366,7 +367,7 @@ impl Store {
             let mut deltas: HashMap<AddrHash, (u64, u64)> = HashMap::new();
 
             if !is_coinbase {
-                for input in &vin {
+                for input in vin {
                     let Some(prev) = input["txid"].as_str().and_then(txid_from_hex) else { continue };
                     let Some(n) = input["vout"].as_u64() else { continue };
                     let op = outpoint_key(&prev, n as u32);

@@ -1,15 +1,15 @@
-//! Blockbook-compatible `/api/v2/*` endpoints (the subset light
-//! wallets use). Amounts are satoshi strings, as in Blockbook.
+//! Transparent address index endpoints. Answers follow Blockbook's API
+//! (the subset light wallets use): amounts are satoshi strings.
 //!
-//!   GET  /api/v2/api
-//!   GET  /api/v2/address/{address}?page&pageSize&from&to&details
-//!   GET  /api/v2/xpub/{xpub}?page&pageSize&from&to&details&tokens&gap
-//!   GET  /api/v2/utxo/{address|xpub}?confirmed&gap
-//!   GET  /api/v2/tx/{txid}
-//!   GET  /api/v2/block-index/{height}
-//!   GET  /api/v2/sendtx/{hex}   POST /api/v2/sendtx/  (body = hex)
-//!   POST /api/v2/watch          (long-poll, bridge extension)
-use std::collections::HashSet;
+//!   GET  /status
+//!   GET  /address/{address}?page&pageSize&from&to&details
+//!   GET  /xpub/{xpub}?page&pageSize&from&to&details&tokens&gap
+//!   GET  /utxo/{address|xpub}?confirmed&gap
+//!   GET  /tx/{txid}
+//!   GET  /block-index/{height}
+//!   GET  /sendtx/{hex}   POST /sendtx  (body = hex)
+//!   POST /watch          (long-poll)
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
@@ -32,18 +32,15 @@ const MAX_GAP: u32 = 1000;
 
 pub fn routes(idx: Arc<AddrIndex>) -> Router {
     Router::new()
-        .route("/api", get(status))
-        .route("/api/v2", get(status))
-        .route("/api/v2/api", get(status))
-        .route("/api/v2/address/{address}", get(address))
-        .route("/api/v2/xpub/{xpub}", get(xpub))
-        .route("/api/v2/utxo/{desc}", get(utxo))
-        .route("/api/v2/tx/{txid}", get(tx))
-        .route("/api/v2/block-index/{height}", get(block_index))
-        .route("/api/v2/sendtx/{hex}", get(send_tx_get))
-        .route("/api/v2/sendtx/", post(send_tx_post))
-        .route("/api/v2/sendtx", post(send_tx_post))
-        .route("/api/v2/watch", post(watch))
+        .route("/status", get(status))
+        .route("/address/{address}", get(address))
+        .route("/xpub/{xpub}", get(xpub))
+        .route("/utxo/{desc}", get(utxo))
+        .route("/tx/{txid}", get(tx))
+        .route("/block-index/{height}", get(block_index))
+        .route("/sendtx/{hex}", get(send_tx_get))
+        .route("/sendtx", post(send_tx_post))
+        .route("/watch", post(watch))
         .with_state(idx)
 }
 
@@ -119,7 +116,7 @@ async fn status(State(idx): State<Arc<AddrIndex>>) -> ApiResult {
         let mempool_size = idx.mempool.read().unwrap().len();
         let (txs, outputs, addresses) = idx.store.counts().unwrap_or_default();
         Ok(Json(json!({
-            "blockbook": {
+            "index": {
                 "coin": "PIVX",
                 "host": "pivx-bridge",
                 "version": env!("CARGO_PKG_VERSION"),
@@ -129,7 +126,7 @@ async fn status(State(idx): State<Arc<AddrIndex>>) -> ApiResult {
                 "inSyncMempool": idx.in_sync.load(Ordering::Relaxed),
                 "mempoolSize": mempool_size,
                 "decimals": 8,
-                "about": "pivx-bridge transparent address index (Blockbook API v2 subset)",
+                "about": "pivx-bridge transparent address index",
                 "indexedTxs": txs,
                 "indexedOutputs": outputs,
                 "indexedAddresses": addresses,
@@ -170,17 +167,51 @@ impl AddrIndex {
         Ok(v)
     }
 
+    /// Verbose tx JSON of the `txids` not cached yet, fetched in JSON-RPC
+    /// batches (one round trip per 100 txs instead of one per tx).
+    fn prefetch_raw(&self, txids: &[Txid]) -> HashMap<Txid, Value> {
+        let missing: Vec<Txid> = {
+            let cache = self.tx_cache.lock().unwrap();
+            txids.iter().filter(|t| !cache.contains(t)).copied().collect()
+        };
+        let mut out = HashMap::new();
+        for chunk in missing.chunks(100) {
+            let params: Vec<Vec<Value>> = chunk.iter().map(|t| vec![json!(txid_to_hex(t)), json!(true)]).collect();
+            // On failure tx_json falls back to one call per tx.
+            let Ok(answers) = self.rpc.batch("getrawtransaction", &params) else { break };
+            for (t, answer) in chunk.iter().zip(answers) {
+                if let Ok(v) = answer {
+                    out.insert(*t, v);
+                }
+            }
+        }
+        out
+    }
+
     /// Blockbook-style transaction object.
     pub fn tx_json(&self, txid: &Txid) -> Result<Value, String> {
+        self.tx_json_with(txid, None)
+    }
+
+    /// [`Self::tx_json`] with the verbose tx JSON already fetched.
+    fn tx_json_with(&self, txid: &Txid, fetched: Option<Value>) -> Result<Value, String> {
         let location = self.store.tx_location(txid)?;
         let mempool_seen = self.mempool.read().unwrap().txs.get(txid).map(|t| t.first_seen);
-        let raw = self.raw_tx(txid, location.is_some())?;
+        let raw = match fetched {
+            Some(v) => {
+                if location.is_some() {
+                    self.tx_cache.lock().unwrap().put(*txid, v.clone());
+                }
+                v
+            }
+            None => self.raw_tx(txid, location.is_some())?,
+        };
         let tip = self.indexed_tip().unwrap_or(0);
 
         let mut value_in: u64 = 0;
         let mut vin_json = Vec::new();
         let mut is_coinbase = false;
-        for (i, input) in raw["vin"].as_array().cloned().unwrap_or_default().iter().enumerate() {
+        for (i, input) in raw["vin"].as_array().map(|a| a.as_slice()).unwrap_or_default().iter().enumerate() {
             if let Some(cb) = input.get("coinbase").and_then(|c| c.as_str()) {
                 is_coinbase = true;
                 vin_json.push(json!({ "n": i, "coinbase": cb, "isAddress": false, "value": "0" }));
@@ -212,7 +243,7 @@ impl AddrIndex {
 
         let mut value_out: u64 = 0;
         let mut vout_json = Vec::new();
-        let outs = raw["vout"].as_array().cloned().unwrap_or_default();
+        let outs: &[Value] = raw["vout"].as_array().map(|a| a.as_slice()).unwrap_or_default();
         let is_coinstake = !is_coinbase
             && outs.len() >= 2
             && value_to_sats(&outs[0]["value"]) == 0
@@ -421,9 +452,10 @@ fn history_json(idx: &AddrIndex, txids: &[Txid], q: &ListQuery, details: Details
         j["txids"] = json!(slice.iter().map(txid_to_hex).collect::<Vec<_>>());
     }
     if details == Details::Txs && !slice.is_empty() {
+        let mut fetched = idx.prefetch_raw(slice);
         let mut list = Vec::with_capacity(slice.len());
         for t in slice {
-            list.push(idx.tx_json(t)?);
+            list.push(idx.tx_json_with(t, fetched.remove(t))?);
         }
         j["transactions"] = json!(list);
     }
@@ -437,7 +469,7 @@ async fn address(
 ) -> ApiResult {
     blocking(move || {
         if is_xpub(&addr) {
-            return Err(bad("use /api/v2/xpub for extended keys"));
+            return Err(bad("use /xpub for extended keys"));
         }
         let details = Details::parse(q.details.as_deref());
         let (bal, recv, sent, _txs, unconf, unconf_txs) = idx.balances(&addr).map_err(internal)?;
@@ -622,7 +654,7 @@ async fn send_tx_post(State(idx): State<Arc<AddrIndex>>, body: String) -> ApiRes
 }
 
 // ---------------------------------------------------------------------------
-// Long-poll (bridge extension, not part of Blockbook)
+// Long-poll
 // ---------------------------------------------------------------------------
 
 const WATCH_DEFAULT_SECS: u64 = 25;
@@ -643,7 +675,7 @@ pub struct WatchRequest {
     timeout: Option<u64>,
 }
 
-/// `POST /api/v2/watch` — answers as soon as a block is indexed or a
+/// `POST /watch` — answers as soon as a block is indexed or a
 /// mempool tx touching one of `addresses` arrives, else after `timeout`
 /// seconds. Response: `{height, hash, mempoolSeq, newBlock, txids,
 /// reset, changed}`. `reset` means the client's `mempoolSeq` is unknown

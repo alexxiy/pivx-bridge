@@ -1,18 +1,18 @@
 [package]
 name = "pivx-bridge"
-version = "0.4.1"
+version = "0.5.0"
 edition = "2021"
 description = "PIVX shield sync bridge — drop-in replacement for PivxNodeController, written in Rust"
 license = "MIT"
 
 [dependencies]
 # HTTP server
-axum = "0.8"
-tokio = { version = "1", features = ["full"] }
-tower-http = { version = "0.6", features = ["cors", "compression-gzip", "fs", "set-header"] }
+axum = "0.8.9"
+tokio = { version = "1.53", features = ["full"] }
+tower-http = { version = "0.7.1", features = ["cors", "compression-gzip", "fs"] }
 
 # RPC client (blocking — used in spawn_blocking)
-ureq = { version = "2", features = ["json"] }
+ureq = "3.4"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -27,13 +27,13 @@ bitcoincore-zmq = { version = "1.5", features = ["async"] }
 futures = "0.3"
 
 # Utilities
-sha2 = "0.10"
+sha2 = "0.11"
 
-# Transparent address index (Blockbook-compatible API)
-redb = "2"
-k256 = { version = "0.13", default-features = false, features = ["arithmetic", "std"] }
-hmac = "0.12"
-ripemd = "0.1"
+# Transparent address index
+redb = "4.3"
+k256 = { version = "0.14", default-features = false, features = ["arithmetic", "std"] }
+hmac = "0.13"
+ripemd = "0.2"
 bs58 = { version = "0.5", features = ["check"] }
 
 # Inline jq filter — pure Rust, no process fork

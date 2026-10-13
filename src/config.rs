@@ -32,6 +32,10 @@ pub struct Config {
     #[arg(long, env = "ZMQ_URL", default_value = "tcp://127.0.0.1:28332")]
     pub zmq_url: String,
 
+    /// ZMQ endpoint of the testnet node (without it testnet polls every 10 s)
+    #[arg(long, env = "TESTNET_ZMQ_URL")]
+    pub testnet_zmq_url: Option<String>,
+
     /// HTTP server port
     #[arg(long, env = "PORT", default_value_t = 3000)]
     pub port: u16,
@@ -44,8 +48,17 @@ pub struct Config {
     #[arg(long, env = "SAPLING_HEIGHT", default_value_t = 2_700_501)]
     pub sapling_height: u32,
 
-    /// Enable the transparent address index + Blockbook-compatible
-    /// `/api/v2/*` endpoints. The first run indexes the whole chain.
+    /// Sapling activation height (testnet)
+    #[arg(long, env = "TESTNET_SAPLING_HEIGHT", default_value_t = 501)]
+    pub testnet_sapling_height: u32,
+
+    /// Which jq filters the RPC proxy runs: known (the ones MyPIVXWallet
+    /// and PIVXie send), any, or off
+    #[arg(long, env = "JQ_FILTERS", value_enum, default_value = "known")]
+    pub jq_filters: crate::proxy::JqMode,
+
+    /// Enable the transparent address index (`/address`, `/xpub`, `/utxo`,
+    /// `/tx`, ...). The first run indexes the whole chain.
     #[arg(long, env = "ADDR_INDEX")]
     pub addr_index: bool,
 
@@ -62,7 +75,8 @@ pub struct Config {
     #[arg(long, env = "SAPLING_PARAMS_DIR")]
     pub sapling_params_dir: Option<String>,
 
-    /// Disable gzip compression (use when behind nginx or another compressing proxy)
+    /// Disable gzip compression of JSON answers (use when behind nginx or
+    /// another compressing proxy). Shield data is never compressed.
     #[arg(long, env = "NO_COMPRESSION")]
     pub no_compression: bool,
 }

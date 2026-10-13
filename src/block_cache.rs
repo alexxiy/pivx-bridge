@@ -107,8 +107,16 @@ impl BlockCache {
             .and_then(|v| v.as_u64())
             .unwrap_or(0) as u32;
 
+        // Another block at this height (reorg): drop it, or its entries
+        // would outlive their height mapping and never be evicted.
+        if let Some(old) = self.height_to_hash.get(&height).filter(|h| h.as_str() != hash).cloned() {
+            for v in 0..=2u8 {
+                self.entries.remove(&(old.clone(), v));
+            }
+        }
+
         // Evict lowest-height entry if at capacity
-        while self.entries.len() >= self.capacity {
+        while self.entries.len() >= self.capacity && !self.height_to_hash.is_empty() {
             self.evict_lowest();
         }
 
@@ -126,17 +134,6 @@ impl BlockCache {
     /// Get the block hash for a given height (if cached).
     pub fn hash_for_height(&self, height: u32) -> Option<&str> {
         self.height_to_hash.get(&height).map(|s| s.as_str())
-    }
-
-    /// Check if a new block's `previousblockhash` diverges from our cache.
-    pub fn detect_reorg(&self, height: u32, prev_hash: &str) -> bool {
-        if height == 0 {
-            return false;
-        }
-        match self.height_to_hash.get(&(height - 1)) {
-            Some(cached) => cached != prev_hash,
-            None => false,
-        }
     }
 
     /// Invalidate all cached blocks at or above `fork_height`.
@@ -244,9 +241,6 @@ mod tests {
         cache.insert("bbb", 1, &make_block(99, "bbb"));
         cache.insert("ccc", 1, &make_block(100, "ccc"));
 
-        assert!(cache.detect_reorg(100, "different_parent"));
-        assert!(!cache.detect_reorg(100, "bbb"));
-
         cache.invalidate_from(99);
         assert!(cache.get("aaa", 1, 200).is_some());
         assert!(cache.get("bbb", 1, 200).is_none());
@@ -292,5 +286,18 @@ mod tests {
         // v2 must miss (→ None) so the proxy re-fetches a real v2 block from the
         // node, rather than being served the v1 (string-tx) entry.
         assert!(cache.get("def", 2, 200).is_none());
+    }
+
+    #[test]
+    fn replaced_block_at_height_is_dropped() {
+        let mut cache = BlockCache::new(2);
+        cache.insert("old", 1, &make_block(100, "old"));
+        cache.insert("new", 1, &make_block(100, "new"));
+        assert!(cache.get("old", 1, 200).is_none());
+        assert_eq!(cache.hash_for_height(100), Some("new"));
+        // Stays within capacity (no stranded entries).
+        cache.insert("a", 1, &make_block(101, "a"));
+        cache.insert("b", 1, &make_block(102, "b"));
+        assert!(cache.entries.len() <= 2);
     }
 }

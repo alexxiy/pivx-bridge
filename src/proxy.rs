@@ -20,6 +20,40 @@ pub struct ProxyQuery {
     pub filter: Option<String>,
 }
 
+/// Which jq filters the proxy runs (`JQ_FILTERS`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum JqMode {
+    /// Only the filters MyPIVXWallet and PIVXie send.
+    Known,
+    /// Any filter. A filter can loop forever or build huge values, so
+    /// only for bridges that trusted clients use.
+    Any,
+    /// No filters.
+    Off,
+}
+
+/// jq filter settings + a cap on filters running at once.
+pub struct JqPolicy {
+    pub mode: JqMode,
+    pub running: tokio::sync::Semaphore,
+}
+
+impl JqPolicy {
+    pub fn new(mode: JqMode) -> Self {
+        Self { mode, running: tokio::sync::Semaphore::new(2) }
+    }
+
+    /// The filter to run for `expr`, or why it is refused.
+    fn accept(&self, expr: &str) -> Result<String, String> {
+        match self.mode {
+            JqMode::Off => Err("jq filters are disabled on this bridge".into()),
+            JqMode::Any if expr.len() > 10_000 => Err("filter expression too long".into()),
+            JqMode::Any => Ok(expr.to_string()),
+            JqMode::Known => known_filter(expr).ok_or_else(|| "filter not allowed on this bridge".into()),
+        }
+    }
+}
+
 /// Handle RPC proxy requests: `GET /mainnet/:method?params=...&filter=...`
 pub async fn rpc_proxy(
     State(state): State<Arc<AppState>>,
@@ -30,6 +64,10 @@ pub async fn rpc_proxy(
     if !state.allowed_rpcs.iter().any(|r| r == &method) {
         return Err((StatusCode::FORBIDDEN, format!("RPC method '{method}' not allowed")));
     }
+    let filter = match query.filter.as_deref() {
+        Some(expr) if !expr.is_empty() => Some(state.jq.accept(expr).map_err(|e| (StatusCode::BAD_REQUEST, e))?),
+        _ => None,
+    };
 
     // Parse params with type coercion (PivxNodeController compat)
     let params = parse_params(query.params.as_deref().unwrap_or(""));
@@ -38,11 +76,10 @@ pub async fn rpc_proxy(
     // Fast path: serve getblockhash from cache
     if method == "getblockhash" {
         if let Some(height) = params.first().and_then(|v| v.as_u64()).map(|h| h as u32) {
-            let cache = state.hash_cache.read().await;
-            if let Some(hash) = cache.get(height) {
-                let result = Json(Value::String(hash.to_string()));
+            let cached = state.hash_cache.read().unwrap().get(height).map(|h| h.to_string());
+            if let Some(hash) = cached {
                 log_timing(start, &method);
-                return Ok(result);
+                return Ok(Json(Value::String(hash)));
             }
         }
     }
@@ -66,14 +103,7 @@ pub async fn rpc_proxy(
             let chain_h = state.chain_height.load(std::sync::atomic::Ordering::Relaxed);
             let cached = state.block_cache.read().unwrap().get(hash, verbosity, chain_h);
             if let Some(json) = cached {
-                // Apply jq filter if present, then return
-                let filtered = match &query.filter {
-                    Some(expr) if !expr.is_empty() => {
-                        apply_jq(&json, expr)
-                            .map_err(|e| (StatusCode::BAD_REQUEST, format!("jq filter error: {e}")))?
-                    }
-                    _ => json,
-                };
+                let filtered = run_filter(&state, json, filter.as_deref()).await?;
                 log_timing(start, &method);
                 return Ok(Json(filtered));
             }
@@ -81,8 +111,11 @@ pub async fn rpc_proxy(
     }
 
     // Call the node
-    let result = state.rpc.proxy_call(&method, &params)
-        .map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
+    let result = {
+        let (state, method, params) = (state.clone(), method.clone(), params.clone());
+        crate::api::blocking(move || state.rpc.proxy_call(&method, &params).map_err(|e| (StatusCode::BAD_GATEWAY, e)))
+            .await?
+    };
 
     // Populate caches for getblockhash and getblock responses
     if method == "getblockhash" {
@@ -90,14 +123,17 @@ pub async fn rpc_proxy(
             params.first().and_then(|v| v.as_u64()).map(|h| h as u32),
             result.as_str(),
         ) {
-            state.hash_cache.write().await.insert(height, hash.to_string());
+            state.hash_cache.write().unwrap().insert(height, hash.to_string());
         }
     } else if method == "getblock" {
-        if let (Some(height), Some(hash)) = (
+        // Only blocks on the main chain (an orphan has confirmations -1).
+        let on_chain = result.get("confirmations").and_then(|v| v.as_i64()).is_some_and(|c| c > 0);
+        if let (true, Some(height), Some(hash)) = (
+            on_chain,
             result.get("height").and_then(|v| v.as_u64()).map(|h| h as u32),
             result.get("hash").and_then(|v| v.as_str()),
         ) {
-            state.hash_cache.write().await.insert(height, hash.to_string());
+            state.hash_cache.write().unwrap().insert(height, hash.to_string());
 
             // Also populate block cache
             let verbosity = params.get(1)
@@ -107,17 +143,7 @@ pub async fn rpc_proxy(
         }
     }
 
-    // Apply jq filter if present — shells out to system `jq` for full compatibility
-    let filtered = match &query.filter {
-        Some(expr) if !expr.is_empty() => {
-            if expr.len() > 10_000 {
-                return Err((StatusCode::BAD_REQUEST, "filter expression too long".into()));
-            }
-            apply_jq(&result, expr)
-                .map_err(|e| (StatusCode::BAD_REQUEST, format!("jq filter error: {e}")))?
-        }
-        _ => result,
-    };
+    let filtered = run_filter(&state, result, filter.as_deref()).await?;
 
     // Log timing + cache stats for getblock
     if method == "getblock" {
@@ -136,6 +162,92 @@ pub async fn rpc_proxy(
         log_timing(start, &method);
     }
     Ok(Json(filtered))
+}
+
+/// Apply an accepted jq filter off the async workers, at most two at once.
+async fn run_filter(state: &Arc<AppState>, value: Value, filter: Option<&str>) -> Result<Value, (StatusCode, String)> {
+    let Some(expr) = filter else { return Ok(value) };
+    let _permit = state.jq.running.acquire().await.map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e.to_string()))?;
+    let expr = expr.to_string();
+    crate::api::blocking(move || {
+        apply_jq(&value, &expr).map_err(|e| (StatusCode::BAD_REQUEST, format!("jq filter error: {e}")))
+    })
+    .await
+}
+
+// ---------------------------------------------------------------------------
+// Known filters
+// ---------------------------------------------------------------------------
+
+/// Canonical form of a filter MyPIVXWallet or PIVXie sends, or `None`:
+///   - MPW getBlock: `. | .txs = [.tx[] | { hex: .hex, txid: .txid}] | del(.tx)`
+///   - MPW vote lookup: `.[] | select(.mnId=="<txid>-<n>")`
+///   - PIVXie vote lookup: `[.[] | select(.mnId == "<txid>-<n>" or ...)]`
+///
+/// Whitespace outside strings is ignored.
+fn known_filter(expr: &str) -> Option<String> {
+    let s = strip_whitespace(expr)?;
+    if s == ".|.txs=[.tx[]|{hex:.hex,txid:.txid}]|del(.tx)" {
+        return Some(". | .txs = [.tx[] | { hex: .hex, txid: .txid}] | del(.tx)".into());
+    }
+    if let Some(ids) = s.strip_prefix(".[]|select(").and_then(|r| r.strip_suffix(')')).and_then(mn_id_clauses) {
+        return Some(format!(".[] | select({ids})"));
+    }
+    if let Some(ids) = s.strip_prefix("[.[]|select(").and_then(|r| r.strip_suffix(")]")).and_then(mn_id_clauses) {
+        return Some(format!("[.[] | select({ids})]"));
+    }
+    None
+}
+
+/// `.mnId=="<id>"` clauses joined by `or`, rebuilt in canonical form.
+fn mn_id_clauses(s: &str) -> Option<String> {
+    let mut rest = s;
+    let mut clauses = Vec::new();
+    loop {
+        let r = rest.strip_prefix(".mnId==\"")?;
+        let q = r.find('"')?;
+        let id = &r[..q];
+        let (txid, n) = id.split_once('-')?;
+        let valid = txid.len() == 64
+            && txid.bytes().all(|b| b.is_ascii_hexdigit())
+            && (1..=5).contains(&n.len())
+            && n.bytes().all(|b| b.is_ascii_digit());
+        if !valid || clauses.len() >= 1_000 {
+            return None;
+        }
+        clauses.push(format!(".mnId == \"{id}\""));
+        rest = &r[q + 1..];
+        if rest.is_empty() {
+            return Some(clauses.join(" or "));
+        }
+        rest = rest.strip_prefix("or")?;
+    }
+}
+
+/// `expr` without whitespace outside string literals (`None` when a
+/// string is not closed).
+fn strip_whitespace(expr: &str) -> Option<String> {
+    let mut out = String::with_capacity(expr.len());
+    let mut in_string = false;
+    let mut escaped = false;
+    for c in expr.chars() {
+        if in_string {
+            out.push(c);
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+        } else if c == '"' {
+            in_string = true;
+            out.push(c);
+        } else if !c.is_whitespace() {
+            out.push(c);
+        }
+    }
+    (!in_string).then_some(out)
 }
 
 /// Write elapsed time directly to stderr — no allocation.
@@ -227,6 +339,10 @@ fn get_compiled_filter(expr: &str) -> Result<Arc<JaqFilter>, String> {
         .map_err(|errs| format!("jq compile: {errs:?}"))?;
 
     let compiled = Arc::new(compiled);
+    // Vote filters differ per masternode set: keep the cache bounded.
+    if cache.len() >= 256 {
+        cache.clear();
+    }
     cache.insert(expr.to_string(), compiled.clone());
     Ok(compiled)
 }
@@ -288,9 +404,9 @@ mod tests {
 
     #[test]
     fn parse_params_types() {
-        let params = parse_params("42,3.14,true,hello");
+        let params = parse_params("42,2.5,true,hello");
         assert_eq!(params[0], json!(42));
-        assert_eq!(params[1], json!(3.14));
+        assert_eq!(params[1], json!(2.5));
         assert_eq!(params[2], json!(true));
         assert_eq!(params[3], json!("hello"));
     }
@@ -332,5 +448,32 @@ mod tests {
         let v = json!({"tx": [{"hex": "abc", "txid": "123", "extra": true}]});
         let result = apply_jq(&v, ". | .txs = [.tx[] | { hex: .hex, txid: .txid}] | del(.tx)").unwrap();
         assert_eq!(result, json!({"txs": [{"hex": "abc", "txid": "123"}]}));
+    }
+
+    #[test]
+    fn known_filters_accepted() {
+        let id = format!("{}-1", "ab".repeat(32));
+        assert_eq!(
+            known_filter(". | .txs = [.tx[] | { hex: .hex, txid: .txid}] | del(.tx)").as_deref(),
+            Some(". | .txs = [.tx[] | { hex: .hex, txid: .txid}] | del(.tx)")
+        );
+        assert_eq!(
+            known_filter(&format!(".[] | select(.mnId==\"{id}\")")),
+            Some(format!(".[] | select(.mnId == \"{id}\")"))
+        );
+        let two = format!("[.[] | select(.mnId == \"{id}\" or .mnId == \"{id}\")]");
+        assert_eq!(known_filter(&two), Some(two.clone()));
+        // The canonical form runs.
+        let votes = json!([{"mnId": id, "Vote": "YES"}, {"mnId": "x-0", "Vote": "NO"}]);
+        assert_eq!(apply_jq(&votes, &known_filter(&two).unwrap()).unwrap(), json!([{"mnId": id, "Vote": "YES"}]));
+    }
+
+    #[test]
+    fn other_filters_refused() {
+        for f in ["def f: f; f", "[range(1e12)]", ".[] | select(.mnId==\"x\")", "..", "[.[] | select(.mnId == \"a\" or true)]"] {
+            assert_eq!(known_filter(f), None, "{f}");
+        }
+        assert!(JqPolicy::new(JqMode::Off).accept(".").is_err());
+        assert!(JqPolicy::new(JqMode::Any).accept(".a").is_ok());
     }
 }

@@ -172,6 +172,111 @@ fn encode_compact_plus_tx(stream: &mut Vec<u8>, compact: &crate::scanner::Compac
     stream.extend_from_slice(&payload);
 }
 
+/// Transform a PivxCompat (0x03) buffer into Compact (0x04) or CompactPlus (0x05).
+///
+/// Walks the raw tx packets, parses Sapling fields via `parse_sapling_tx`,
+/// and re-encodes as compact packets. Block footers (9 bytes with time) become
+/// compact headers (5 bytes, height only, before txs).
+pub fn pivxcompat_to_compact(data: &[u8], format: StreamFormat) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len() / 2); // compact is smaller
+    let mut pos = 0;
+    let mut pending_txs: Vec<Vec<u8>> = Vec::new();
+
+    while pos + 4 <= data.len() {
+        let pkt_len = u32::from_le_bytes([data[pos], data[pos+1], data[pos+2], data[pos+3]]) as usize;
+        let pkt_end = pos + 4 + pkt_len;
+        if pkt_end > data.len() || pkt_len == 0 { break; }
+
+        let pkt_type = data[pos + 4];
+
+        if pkt_type == 0x5d && pkt_len == 9 {
+            // Block footer → emit compact header + compact txs
+            let height = u32::from_le_bytes([data[pos+5], data[pos+6], data[pos+7], data[pos+8]]);
+
+            // Compact block header (5 bytes)
+            out.extend(5u32.to_le_bytes());
+            out.push(0x5d);
+            out.extend(height.to_le_bytes());
+
+            // Encode each raw tx as compact
+            for raw_tx in &pending_txs {
+                if let Ok(Some(compact)) = crate::scanner::parse_sapling_tx(raw_tx) {
+                    encode_compact_packet(&mut out, &compact, format);
+                }
+            }
+            pending_txs.clear();
+        } else {
+            // Raw tx (type byte is first byte of the tx = 0x03 for v3)
+            pending_txs.push(data[pos + 4..pkt_end].to_vec());
+        }
+
+        pos = pkt_end;
+    }
+
+    out
+}
+
+/// Encode a single compact or compact+ tx packet.
+fn encode_compact_packet(out: &mut Vec<u8>, compact: &crate::scanner::CompactTx, format: StreamFormat) {
+    const ENC_CT: usize = 580;
+    const OUT_CT: usize = 80;
+
+    let (pkt_type, output_size) = match format {
+        StreamFormat::Compact => (0x04u8, 32 + 32 + 32 + ENC_CT + OUT_CT), // cv+cmu+epk+enc+out
+        StreamFormat::CompactPlus => (0x05u8, 32 + 32 + ENC_CT),           // cmu+epk+enc
+        _ => unreachable!(),
+    };
+
+    // Build the payload first, then prefix its exact length. The spend/output
+    // counts are CompactSize varints (not single bytes), so the header size is
+    // variable — measuring the built payload keeps the length prefix correct
+    // regardless of count size. (A previous u8 count silently truncated for
+    // txs with >255 spends/outputs, corrupting the stream.)
+    let cap = 1 + 9 + 9 + compact.nullifiers.len() * 32 + compact.outputs.len() * output_size;
+    let mut payload = Vec::with_capacity(cap);
+    payload.push(pkt_type);
+    write_compact_size(&mut payload, compact.nullifiers.len());
+    write_compact_size(&mut payload, compact.outputs.len());
+
+    for nf in &compact.nullifiers {
+        payload.extend_from_slice(nf);
+    }
+
+    for o in &compact.outputs {
+        if format == StreamFormat::Compact {
+            payload.extend_from_slice(&o.cv);
+        }
+        payload.extend_from_slice(&o.cmu);
+        payload.extend_from_slice(&o.epk);
+        payload.extend_from_slice(&o.enc_ciphertext);
+        if format == StreamFormat::Compact {
+            payload.extend_from_slice(&o.out_ciphertext);
+        }
+    }
+
+    out.extend((payload.len() as u32).to_le_bytes());
+    out.extend_from_slice(&payload);
+}
+
+/// Byte length of the leading complete blocks in a PIVX-compat stream
+/// (up to and including the last 0x5d footer).
+pub fn complete_blocks_len(data: &[u8]) -> usize {
+    let mut pos = 0;
+    let mut end = 0;
+    while pos + 4 <= data.len() {
+        let len = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
+        let packet_end = pos + 4 + len;
+        if len == 0 || packet_end > data.len() {
+            break;
+        }
+        if len == 9 && data[pos + 4] == PACKET_TYPE_BLOCK {
+            end = packet_end;
+        }
+        pos = packet_end;
+    }
+    end
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -353,7 +458,7 @@ mod tests {
             make_fake_tx_with_compact(vec![0x03, 0x00, 0x00, 0x00], compact),
         ]);
 
-        let compact_stream = encode_shield_stream(&[block.clone()], StreamFormat::Compact);
+        let compact_stream = encode_shield_stream(std::slice::from_ref(&block), StreamFormat::Compact);
         let plus_stream = encode_shield_stream(&[block], StreamFormat::CompactPlus);
 
         // CompactPlus should be smaller (no cv or out_ciphertext: -112 bytes per output)
@@ -412,5 +517,83 @@ mod tests {
         assert_eq!(n_spends, 300, "300 spends must round-trip (not 300 % 256 = 44)");
         assert_eq!(n_outputs, 0);
         assert_eq!(len, 1 + 3 + 1 + 300 * 32, "type + CompactSize(300)=3 + CompactSize(0)=1 + 300 nullifiers");
+    }
+}
+
+#[cfg(test)]
+mod compact_conversion_tests {
+    use super::*;
+
+    /// Golden vector: first 3 blocks of real PIVX shield.bin (mainnet).
+    const SHIELD_SLICE: &[u8] = include_bytes!("../tests/shield_slice.bin");
+
+    fn parse_block_heights(data: &[u8], footer_len: usize) -> Vec<u32> {
+        let mut heights = Vec::new();
+        let mut pos = 0;
+        while pos + 4 <= data.len() {
+            let pkt_len = u32::from_le_bytes([data[pos], data[pos+1], data[pos+2], data[pos+3]]) as usize;
+            let pkt_end = pos + 4 + pkt_len;
+            if pkt_end > data.len() || pkt_len == 0 { break; }
+            if data[pos + 4] == 0x5d && pkt_len == footer_len {
+                heights.push(u32::from_le_bytes([data[pos+5], data[pos+6], data[pos+7], data[pos+8]]));
+            }
+            pos = pkt_end;
+        }
+        heights
+    }
+
+    fn count_tx_packets(data: &[u8], pkt_type: u8) -> usize {
+        let mut count = 0;
+        let mut pos = 0;
+        while pos + 4 <= data.len() {
+            let pkt_len = u32::from_le_bytes([data[pos], data[pos+1], data[pos+2], data[pos+3]]) as usize;
+            let pkt_end = pos + 4 + pkt_len;
+            if pkt_end > data.len() || pkt_len == 0 { break; }
+            if data[pos + 4] == pkt_type { count += 1; }
+            pos = pkt_end;
+        }
+        count
+    }
+
+    #[test]
+    fn pivxcompat_to_compact_golden_vector() {
+        let compact = pivxcompat_to_compact(SHIELD_SLICE, StreamFormat::Compact);
+
+        // Source has 3 blocks with PivxCompat footers (9 bytes)
+        let src_heights = parse_block_heights(SHIELD_SLICE, 9);
+        assert_eq!(src_heights.len(), 3, "golden vector should have 3 blocks");
+
+        // Compact output should have 3 blocks with compact headers (5 bytes)
+        let dst_heights = parse_block_heights(&compact, 5);
+        assert_eq!(dst_heights, src_heights, "compact must preserve block heights");
+
+        // Compact should have 0x04 tx packets, not 0x03
+        assert_eq!(count_tx_packets(SHIELD_SLICE, 0x03), count_tx_packets(&compact, 0x04),
+            "compact must have same number of txs as source");
+        assert_eq!(count_tx_packets(&compact, 0x03), 0,
+            "compact must not contain raw tx packets");
+
+        // Compact should be smaller
+        assert!(compact.len() < SHIELD_SLICE.len(),
+            "compact ({}) should be smaller than pivxcompat ({})", compact.len(), SHIELD_SLICE.len());
+    }
+
+    #[test]
+    fn pivxcompat_to_compactplus_golden_vector() {
+        let compact = pivxcompat_to_compact(SHIELD_SLICE, StreamFormat::Compact);
+        let compact_plus = pivxcompat_to_compact(SHIELD_SLICE, StreamFormat::CompactPlus);
+
+        // CompactPlus should be even smaller (strips cv + out_ciphertext)
+        assert!(compact_plus.len() < compact.len(),
+            "compact+ ({}) should be smaller than compact ({})", compact_plus.len(), compact.len());
+
+        // Same block heights
+        let cp_heights = parse_block_heights(&compact_plus, 5);
+        let src_heights = parse_block_heights(SHIELD_SLICE, 9);
+        assert_eq!(cp_heights, src_heights);
+
+        // 0x05 packets
+        assert_eq!(count_tx_packets(&compact_plus, 0x05), count_tx_packets(SHIELD_SLICE, 0x03));
+        assert_eq!(count_tx_packets(&compact_plus, 0x04), 0);
     }
 }

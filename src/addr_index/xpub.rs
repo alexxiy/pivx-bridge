@@ -1,8 +1,8 @@
 //! BIP32 extended public key parsing + non-hardened derivation, and
 //! PIVX P2PKH address encoding. Enough to walk a BIP44 account xpub
 //! the way Blockbook does (chains 0/1, gap limit).
-use hmac::{Hmac, Mac};
-use k256::elliptic_curve::sec1::ToEncodedPoint;
+use hmac::{Hmac, KeyInit, Mac};
+use k256::elliptic_curve::sec1::ToSec1Point;
 use k256::elliptic_curve::PrimeField;
 use k256::{ProjectivePoint, PublicKey, Scalar};
 use ripemd::Ripemd160;
@@ -39,7 +39,7 @@ impl ExtendedPubKey {
             return Err("cannot derive hardened child from xpub".into());
         }
         let mut mac = HmacSha512::new_from_slice(&self.chain_code).expect("hmac key");
-        mac.update(self.public_key.to_encoded_point(true).as_bytes());
+        mac.update(self.public_key.to_sec1_point(true).as_bytes());
         mac.update(&index.to_be_bytes());
         let i = mac.finalize().into_bytes();
         let il: [u8; 32] = i[..32].try_into().unwrap();
@@ -52,7 +52,7 @@ impl ExtendedPubKey {
     }
 
     pub fn p2pkh_address(&self, prefix: u8) -> String {
-        let sha = Sha256::digest(self.public_key.to_encoded_point(true).as_bytes());
+        let sha = Sha256::digest(self.public_key.to_sec1_point(true).as_bytes());
         let h160 = Ripemd160::digest(sha);
         let mut payload = Vec::with_capacity(21);
         payload.push(prefix);
@@ -77,7 +77,7 @@ mod tests {
         let k = ExtendedPubKey::parse(xpub).unwrap();
         let child = k.derive_child(2).unwrap();
         assert_eq!(
-            hex(child.public_key.to_encoded_point(true).as_bytes()),
+            hex(child.public_key.to_sec1_point(true).as_bytes()),
             "02e8445082a72f29b75ca48748a914df60622a609cacfce8ed0e35804560741d29"
         );
     }

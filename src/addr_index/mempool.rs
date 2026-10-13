@@ -38,14 +38,14 @@ pub struct Mempool {
     by_addr: HashMap<AddrHash, HashSet<Txid>>,
     /// Outpoints (txid, vout) spent by some mempool tx.
     spent: HashSet<(Txid, u32)>,
-    /// Bumped for every tx added; lets `/api/v2/watch` clients ask
+    /// Bumped for every tx added; lets `/watch` clients ask
     /// "what arrived since N".
     seq: u64,
     /// Recent arrivals: (seq, txid, touched addresses), oldest first.
     events: VecDeque<(u64, Txid, Vec<AddrHash>)>,
 }
 
-/// Arrival events kept for `/api/v2/watch`. A client further behind
+/// Arrival events kept for `/watch`. A client further behind
 /// than this is told to resync.
 const MAX_EVENTS: usize = 10_000;
 
@@ -163,7 +163,7 @@ impl Mempool {
 
     fn build_inner(&self, txid: Txid, v: &Value, store: &Store, now: u64, allow_missing: bool) -> Option<MempoolTx> {
         let mut inputs = Vec::new();
-        for input in v["vin"].as_array().cloned().unwrap_or_default() {
+        for input in v["vin"].as_array().map(|a| a.as_slice()).unwrap_or_default() {
             let Some(prev) = input["txid"].as_str().and_then(txid_from_hex) else { continue };
             let n = input["vout"].as_u64().unwrap_or(0) as u32;
             match self.resolve_prevout(store, &prev, n) {
@@ -175,7 +175,7 @@ impl Mempool {
             }
         }
         let mut outputs = Vec::new();
-        for (i, out) in v["vout"].as_array().cloned().unwrap_or_default().iter().enumerate() {
+        for (i, out) in v["vout"].as_array().map(|a| a.as_slice()).unwrap_or_default().iter().enumerate() {
             outputs.push(MempoolOutput {
                 n: out["n"].as_u64().unwrap_or(i as u64) as u32,
                 value: value_to_sats(&out["value"]),

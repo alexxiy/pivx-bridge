@@ -3,37 +3,58 @@ use serde_json::{json, Value};
 
 pub struct RpcClient {
     url: String,
-    user: String,
-    pass: String,
+    auth: String,
     agent: ureq::Agent,
 }
 
+/// Largest RPC answer read (a batch of verbose transactions can be big).
+const MAX_RESPONSE_BYTES: u64 = 256 * 1024 * 1024;
+
 impl RpcClient {
     pub fn new(url: &str, user: &str, pass: &str) -> Self {
+        let agent = ureq::Agent::config_builder()
+            .timeout_global(Some(std::time::Duration::from_secs(30)))
+            .http_status_as_error(false)
+            .max_idle_connections_per_host(4)
+            .build()
+            .into();
         Self {
             url: url.to_string(),
-            user: user.to_string(),
-            pass: pass.to_string(),
-            agent: ureq::AgentBuilder::new()
-                .max_idle_connections(4)
-                .timeout(std::time::Duration::from_secs(30))
-                .build(),
+            auth: format!("Basic {}", base64_encode(&format!("{user}:{pass}"))),
+            agent,
         }
     }
 
-    #[allow(dead_code)]
-    pub fn url(&self) -> &str {
-        &self.url
+    /// POST a JSON-RPC body and return the decoded answer.
+    fn post(&self, body: &Value) -> Result<Value, String> {
+        let mut resp = self
+            .agent
+            .post(&self.url)
+            .header("Authorization", &self.auth)
+            .header("Content-Type", "application/json")
+            .send(body.to_string())
+            .map_err(|e| format!("connection error: {e}"))?;
+        let status = resp.status();
+        let text = resp
+            .body_mut()
+            .with_config()
+            .limit(MAX_RESPONSE_BYTES)
+            .read_to_string()
+            .map_err(|e| format!("read error: {e}"))?;
+        match serde_json::from_str::<Value>(&text) {
+            Ok(json) => Ok(json),
+            Err(_) if !status.is_success() => Err(format!("HTTP {}: {text}", status.as_u16())),
+            Err(e) => Err(format!("JSON parse error: {e}")),
+        }
     }
 
-    #[allow(dead_code)]
-    pub fn user(&self) -> &str {
-        &self.user
-    }
-
-    #[allow(dead_code)]
-    pub fn pass(&self) -> &str {
-        &self.pass
+    /// The `result` of one JSON-RPC answer, or its error message.
+    fn result_of(json: &Value) -> Result<Value, String> {
+        if let Some(err) = json.get("error").filter(|e| !e.is_null()) {
+            let msg = err.get("message").and_then(|m| m.as_str()).unwrap_or("unknown RPC error");
+            return Err(msg.to_string());
+        }
+        Ok(json.get("result").cloned().unwrap_or(Value::Null))
     }
 
     /// Send a JSON-RPC 1.0 request and return the "result" field.
@@ -44,42 +65,36 @@ impl RpcClient {
             "method": method,
             "params": params,
         });
+        Self::result_of(&self.post(&body)?)
+    }
 
-        let response = self.agent
-            .post(&self.url)
-            .set("Authorization", &format!(
-                "Basic {}",
-                base64_encode(&format!("{}:{}", self.user, self.pass))
-            ))
-            .set("Content-Type", "application/json")
-            .send_string(&body.to_string());
-
-        match response {
-            Ok(resp) => {
-                let json: Value = resp.into_json()
-                    .map_err(|e| format!("JSON parse error: {e}"))?;
-                if let Some(err) = json.get("error").and_then(|e| {
-                    if e.is_null() { None } else { Some(e) }
-                }) {
-                    let msg = err.get("message")
-                        .and_then(|m| m.as_str())
-                        .unwrap_or("unknown RPC error");
-                    return Err(msg.to_string());
-                }
-                Ok(json.get("result").cloned().unwrap_or(Value::Null))
-            }
-            Err(ureq::Error::Status(code, resp)) => {
-                let body = resp.into_string().unwrap_or_default();
-                // Try to extract the RPC error message from the JSON body
-                if let Ok(json) = serde_json::from_str::<Value>(&body) {
-                    if let Some(msg) = json.pointer("/error/message").and_then(|m| m.as_str()) {
-                        return Err(msg.to_string());
-                    }
-                }
-                Err(format!("HTTP {code}: {body}"))
-            }
-            Err(e) => Err(format!("connection error: {e}")),
+    /// Several calls of `method` in one JSON-RPC batch request. Answers
+    /// come back in the order of `params`.
+    pub fn batch(&self, method: &str, params: &[Vec<Value>]) -> Result<Vec<Result<Value, String>>, String> {
+        if params.is_empty() {
+            return Ok(Vec::new());
         }
+        let body = Value::Array(
+            params
+                .iter()
+                .enumerate()
+                .map(|(i, p)| json!({ "jsonrpc": "1.0", "id": i, "method": method, "params": p }))
+                .collect(),
+        );
+        let answer = self.post(&body)?;
+        let Value::Array(items) = answer else {
+            // A node error for the whole batch comes back as one object.
+            return Err(Self::result_of(&answer).err().unwrap_or_else(|| "batch: unexpected answer".into()));
+        };
+        let mut out: Vec<Result<Value, String>> = vec![Err("missing batch answer".into()); params.len()];
+        for item in items {
+            if let Some(i) = item.get("id").and_then(|v| v.as_u64()).map(|v| v as usize) {
+                if i < out.len() {
+                    out[i] = Self::result_of(&item);
+                }
+            }
+        }
+        Ok(out)
     }
 
     // -- Convenience methods --

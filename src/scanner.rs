@@ -1,13 +1,12 @@
 /// Block scanner — extracts Sapling transactions from the PIVX node.
 ///
-/// Uses verbosity 1 (txid list) + getrawtransaction (raw hex) to avoid
-/// potential issues with JSON serialization of Sapling txs.
-use crate::block_cache::BlockCache;
+/// Reads `getblock <hash> 2` answers (raw tx hex inline) and keeps the
+/// Sapling transactions.
 use crate::hex;
-use crate::rpc::RpcClient;
 
 /// PIVX Sapling transaction header: nVersion=3 (i16 LE) + nType=0 (i16 LE).
 /// Kerrigan/Dash uses nType=10 (0x0a 0x00) for its Sapling-capable transactions.
+#[cfg(test)]
 const SAPLING_HEADER: [u8; 4] = [0x03, 0x00, 0x00, 0x00];
 
 /// Size of each spend description in bytes.
@@ -71,233 +70,48 @@ pub struct CompactOutput {
 }
 
 // ---------------------------------------------------------------------------
-// Block cache helpers
-// ---------------------------------------------------------------------------
-
-/// Fetch a `getblock` response, checking the cache first.
-///
-/// On cache miss, fetches from the node and populates the cache.
-fn fetch_block(
-    rpc: &RpcClient,
-    hash: &str,
-    verbosity: u32,
-    cache: &std::sync::RwLock<BlockCache>,
-    chain_height: u32,
-) -> Result<serde_json::Value, ScanError> {
-    // Read lock — concurrent readers allowed
-    {
-        let c = cache.read().unwrap();
-        if let Some(json) = c.get(hash, verbosity as u8, chain_height) {
-            return Ok(json);
-        }
-    }
-
-    // Cache miss — fetch from node
-    let json = rpc
-        .get_block(hash, verbosity)
-        .map_err(|e| ScanError::Rpc(format!("getblock({hash}): {e}")))?;
-
-    // Write lock — insert into cache
-    {
-        let mut c = cache.write().unwrap();
-        c.insert(hash, verbosity as u8, &json);
-    }
-
-    Ok(json)
-}
-
-// ---------------------------------------------------------------------------
 // Block scanning
 // ---------------------------------------------------------------------------
 
-/// Scan a single block by hash for Sapling transactions.
-fn scan_block_inner(
-    rpc: &RpcClient,
-    block_json: &serde_json::Value,
-    height: u32,
-) -> Result<Option<ShieldBlock>, ScanError> {
-    let txids = block_json
+/// Hex prefix of a Sapling-capable tx (see `SAPLING_HEADER`): other txs
+/// are skipped without decoding them.
+const SAPLING_HEADER_HEX: &str = "03000000";
+
+/// Shield transactions of a `getblock <hash> 2` answer, or `None` when the
+/// block has none.
+pub fn scan_block_json(block_json: &serde_json::Value) -> Result<Option<ShieldBlock>, ScanError> {
+    let height = block_json
+        .get("height")
+        .and_then(|v| v.as_u64())
+        .ok_or(ScanError::Parse("missing 'height' in block".into()))? as u32;
+    let txs_json = block_json
         .get("tx")
         .and_then(|t| t.as_array())
         .ok_or(ScanError::Parse("missing 'tx' array in block".into()))?;
-
-    let time = block_json
-        .get("time")
-        .and_then(|t| t.as_u64())
-        .unwrap_or(0) as u32;
+    let time = block_json.get("time").and_then(|t| t.as_u64()).unwrap_or(0) as u32;
 
     let mut txs = Vec::new();
-
-    for txid_val in txids {
-        // Verbosity 2: tx is an object with "hex" field inline
-        // Verbosity 1: tx is a txid string, need separate getrawtransaction
-        let raw_hex = if let Some(hex) = txid_val.get("hex").and_then(|h| h.as_str()) {
-            hex.to_string()
-        } else if let Some(txid) = txid_val.as_str() {
-            match rpc.get_raw_transaction(txid, false) {
-                Ok(val) => match val.as_str() {
-                    Some(s) => s.to_string(),
-                    None => continue,
-                },
-                Err(e) => {
-                    eprintln!("  Warning: getrawtransaction({txid}): {e} — skipping");
-                    continue;
-                }
-            }
-        } else {
+    for tx in txs_json {
+        let raw_hex = tx
+            .get("hex")
+            .and_then(|h| h.as_str())
+            .ok_or_else(|| ScanError::Parse(format!("block {height}: tx without hex (needs verbosity 2)")))?;
+        if !raw_hex.starts_with(SAPLING_HEADER_HEX) {
             continue;
-        };
-
-        let tx_bytes = match hex::hex_decode(&raw_hex) {
-            Some(b) => b,
-            None => continue,
-        };
-
-        // Check for PIVX v3 transaction (Sapling-capable)
-        if tx_bytes.len() >= 4 && tx_bytes[..4] == SAPLING_HEADER {
-            // Try to parse Sapling payload — returns None if no shielded data
-            match parse_sapling_tx(&tx_bytes) {
-                Ok(Some(compact)) => {
-                    txs.push(ShieldTx { raw: tx_bytes, compact: Some(compact) });
-                }
-                Ok(None) => {
-                    // v3 tx but no shielded data — skip
-                }
-                Err(_) => {
-                    // Parse failed — not a Sapling tx, skip
-                }
-            }
         }
-    }
-
-    if txs.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(ShieldBlock { height, time, txs }))
-    }
-}
-
-/// Scan a single block by height, using the block cache.
-    #[allow(dead_code)]
-pub fn scan_block(
-    rpc: &RpcClient,
-    height: u32,
-    block_cache: &std::sync::RwLock<BlockCache>,
-    chain_height: u32,
-) -> Result<Option<ShieldBlock>, ScanError> {
-    // Try hash from cache first, then RPC
-    let hash = {
-        let c = block_cache.read().unwrap();
-        c.hash_for_height(height).map(String::from)
-    };
-    let hash = match hash {
-        Some(h) => h,
-        None => rpc
-            .get_block_hash(height)
-            .map_err(|e| ScanError::Rpc(format!("getblockhash({height}): {e}")))?,
-    };
-
-    // Verbosity 2: includes full tx hex inline (no separate getrawtransaction needed)
-    let block_json = fetch_block(rpc, &hash, 2, block_cache, chain_height)?;
-
-    let h = block_json
-        .get("height")
-        .and_then(|v| v.as_u64())
-        .map(|v| v as u32)
-        .unwrap_or(height);
-
-    scan_block_inner(rpc, &block_json, h)
-}
-
-/// Scan a range of blocks by chaining via `nextblockhash`.
-///
-/// All `getblock` results are cached for subsequent requests.
-pub fn scan_range(
-    rpc: &RpcClient,
-    start: u32,
-    end: u32,
-    block_cache: &std::sync::RwLock<BlockCache>,
-    chain_height: u32,
-    on_progress: impl Fn(u32, u32),
-) -> Result<Vec<ShieldBlock>, ScanError> {
-    let mut shield_blocks = Vec::new();
-    let total = end.saturating_sub(start) + 1;
-    let mut errors = 0u32;
-
-    // Get the first block hash (check cache, then RPC)
-    let mut current_hash = {
-        let c = block_cache.read().unwrap();
-        c.hash_for_height(start).map(String::from)
-    };
-    let mut current_hash = match current_hash.take() {
-        Some(h) => h,
-        None => rpc
-            .get_block_hash(start)
-            .map_err(|e| ScanError::Rpc(format!("getblockhash({start}): {e}")))?,
-    };
-
-    for height in start..=end {
-        on_progress(height - start, total);
-
-        let block_json = match fetch_block(rpc, &current_hash, 2, block_cache, chain_height) {
-            Ok(json) => json,
-            Err(e) => {
-                eprintln!("\n  Warning: block {height} ({current_hash}): {e} — skipping");
-                errors += 1;
-                match rpc.get_block_hash(height + 1) {
-                    Ok(hash) => {
-                        current_hash = hash;
-                        continue;
-                    }
-                    Err(_) => break,
-                }
-            }
-        };
-
-        match scan_block_inner(rpc, &block_json, height) {
-            Ok(Some(block)) => {
-                let tx_count = block.txs.len();
-                shield_blocks.push(block);
-                if tx_count > 0 {
-                    eprintln!("\n  Found shield block {height} ({tx_count} Sapling tx{})",
-                        if tx_count == 1 { "" } else { "s" });
-                }
-            }
+        let tx_bytes = hex::hex_decode(raw_hex)
+            .ok_or_else(|| ScanError::Parse(format!("block {height}: bad tx hex")))?;
+        match parse_sapling_tx(&tx_bytes) {
+            Ok(Some(compact)) => txs.push(ShieldTx { raw: tx_bytes, compact: Some(compact) }),
             Ok(None) => {}
             Err(e) => {
-                eprintln!("\n  Warning: block {height} parse error: {e} — skipping");
-                errors += 1;
+                let txid = tx.get("txid").and_then(|t| t.as_str()).unwrap_or("?");
+                eprintln!("  Warning: block {height} tx {txid}: not parsed as Sapling ({e}), skipped");
             }
         }
-
-        // Chain to next block via nextblockhash (rehydrated) or hash lookup
-        if height < end {
-            current_hash = match block_json.get("nextblockhash").and_then(|v| v.as_str()) {
-                Some(next) => next.to_string(),
-                None => {
-                    let c = block_cache.read().unwrap();
-                    match c.hash_for_height(height + 1) {
-                        Some(h) => h.to_string(),
-                        None => {
-                            drop(c);
-                            match rpc.get_block_hash(height + 1) {
-                                Ok(h) => h,
-                                Err(_) => break,
-                            }
-                        }
-                    }
-                }
-            };
-        }
     }
 
-    on_progress(total, total);
-
-    if errors > 0 {
-        eprintln!("\n  Completed with {errors} skipped block(s)");
-    }
-
-    Ok(shield_blocks)
+    Ok((!txs.is_empty()).then_some(ShieldBlock { height, time, txs }))
 }
 
 // ---------------------------------------------------------------------------
@@ -442,14 +256,12 @@ pub(crate) fn read_compact_size(data: &[u8], pos: usize) -> Result<(usize, usize
 
 #[derive(Debug)]
 pub enum ScanError {
-    Rpc(String),
     Parse(String),
 }
 
 impl std::fmt::Display for ScanError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Rpc(e) => write!(f, "scanner RPC error: {e}"),
             Self::Parse(e) => write!(f, "scanner parse error: {e}"),
         }
     }
@@ -495,6 +307,7 @@ mod tests {
     fn sapling_header_correct() {
         // PIVX: nVersion=3 (i16 LE) + nType=0 (i16 LE)
         assert_eq!(SAPLING_HEADER, [0x03, 0x00, 0x00, 0x00]);
+        assert_eq!(hex::hex_decode(SAPLING_HEADER_HEX).unwrap(), SAPLING_HEADER);
     }
 
     #[test]

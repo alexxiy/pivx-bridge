@@ -1,6 +1,6 @@
-//! Transparent address index + Blockbook-compatible API.
+//! Transparent address index (answers in Blockbook's format).
 //!
-//! Lets light wallets (MyPIVXWallet's `ExplorerNetwork`, PIVXie) fetch
+//! Lets light wallets (PIVXie) fetch
 //! transparent history, balances and UTXOs for an address or a BIP44
 //! account xpub from the bridge itself — no separate Blockbook needed.
 //!
@@ -62,6 +62,9 @@ impl TxCache {
     pub fn get(&self, t: &Txid) -> Option<Value> {
         self.map.get(t).cloned()
     }
+    pub fn contains(&self, t: &Txid) -> bool {
+        self.map.contains_key(t)
+    }
     pub fn put(&mut self, t: Txid, v: Value) {
         if self.map.contains_key(&t) {
             return;
@@ -79,7 +82,7 @@ impl TxCache {
 /// Derived-address cache per xpub: chain -> addresses[index].
 pub type XpubCache = HashMap<String, [Vec<String>; 2]>;
 
-/// What `/api/v2/watch` waits on: indexed tip and mempool sequence.
+/// What `/watch` waits on: indexed tip and mempool sequence.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct WatchState {
     pub height: u32,
@@ -316,7 +319,7 @@ impl AddrIndex {
         result
     }
 
-    /// Wake `/api/v2/watch` waiters if the tip or mempool moved.
+    /// Wake `/watch` waiters if the tip or mempool moved.
     fn publish_changes(&self) {
         let Some(height) = self.indexed_tip() else { return };
         let hash = self.store.block_info(height).ok().flatten().map(|(h, _)| h).unwrap_or_default();
