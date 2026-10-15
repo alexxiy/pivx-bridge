@@ -105,12 +105,41 @@ pub struct AddrIndex {
     pub changes: tokio::sync::watch::Sender<WatchState>,
 }
 
+/// How often a node that is still starting is asked again.
+const NODE_RETRY: Duration = Duration::from_secs(5);
+
+/// The node's chain (`getblockchaininfo.chain`). Waits while the node is
+/// starting (not listening yet, or still loading); other errors, like a
+/// wrong RPC password, are returned.
+fn node_chain(label: &str, rpc: &RpcClient) -> Result<String, String> {
+    loop {
+        match rpc.proxy_call("getblockchaininfo", &[]) {
+            Ok(info) => return Ok(info["chain"].as_str().unwrap_or("main").to_string()),
+            Err(e) if crate::rpc::node_starting(&e) => {
+                eprintln!("  [{label}] addr-index: waiting for the node ({e})");
+                std::thread::sleep(NODE_RETRY);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 impl AddrIndex {
+    /// Opens the index at `path`. It records the chain it indexes, so this
+    /// doesn't need the node, which may still be starting (after a
+    /// reboot). Only an index without a recorded chain asks the node,
+    /// waiting for it if needed.
     pub fn open(label: &'static str, path: &str, rpc_url: &str, user: &str, pass: &str) -> Result<Arc<Self>, String> {
         let rpc = RpcClient::new(rpc_url, user, pass);
-        let info = rpc.proxy_call("getblockchaininfo", &[])?;
-        let chain = info["chain"].as_str().unwrap_or("main").to_string();
         let store = Store::open(path)?;
+        let chain = match store.chain()? {
+            Some(chain) => chain,
+            None => {
+                let chain = node_chain(label, &rpc)?;
+                store.set_chain(&chain)?;
+                chain
+            }
+        };
         let tip = store.tip()?;
         let initial = WatchState {
             height: tip.unwrap_or(0),
@@ -127,7 +156,8 @@ impl AddrIndex {
             mempool: RwLock::new(Mempool::default()),
             rpc,
             net: NetParams::from_chain(&chain),
-            node_tip: AtomicU32::new(info["blocks"].as_u64().unwrap_or(0) as u32),
+            // Set by the indexer's first pass.
+            node_tip: AtomicU32::new(0),
             in_sync: AtomicBool::new(false),
             tx_cache: Mutex::new(TxCache::new(20_000)),
             xpub_cache: Mutex::new(HashMap::new()),
@@ -146,6 +176,7 @@ impl AddrIndex {
             .name(format!("addr-index-{}", self.label))
             .spawn(move || {
                 let rpc = RpcClient::new(&rpc_url, &user, &pass);
+                idx.check_chain(&rpc);
                 loop {
                     if let Err(e) = idx.sync_blocks(&rpc_url, &user, &pass, &rpc) {
                         eprintln!("  [{}] addr-index: {e} — retrying", idx.label);
@@ -162,6 +193,29 @@ impl AddrIndex {
                 }
             })
             .expect("spawn addr-index thread");
+    }
+
+    /// Once the node answers, exits the process if it is on another chain
+    /// than the index (RPC pointed at the wrong network): indexing on would
+    /// roll the whole index back as a reorg.
+    fn check_chain(&self, rpc: &RpcClient) {
+        let chain = loop {
+            match node_chain(self.label, rpc) {
+                Ok(chain) => break chain,
+                Err(e) => {
+                    eprintln!("  [{}] addr-index: {e} — retrying", self.label);
+                    std::thread::sleep(NODE_RETRY);
+                }
+            }
+        };
+        if chain != self.net.chain {
+            eprintln!(
+                "  [{}] Address index holds chain {} but the node is on {chain}: fix the RPC settings, \
+                 or delete the index to rebuild it for this node",
+                self.label, self.net.chain
+            );
+            std::process::exit(1);
+        }
     }
 
     /// Bring the index to the node tip, rolling back on reorgs.

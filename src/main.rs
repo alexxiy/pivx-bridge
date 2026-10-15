@@ -141,7 +141,8 @@ fn spawn_zmq_listener(label: &'static str, zmq_url: String, trigger: mpsc::Sende
 
 /// Open the address index, start its indexer thread and return its
 /// routes. Exits the process if the index can't be opened (an operator
-/// who asked for it should notice).
+/// who asked for it should notice). A node that is still starting isn't a
+/// reason: the index waits for it.
 fn start_addr_index(label: &'static str, path: &str, rpc: &RpcConfig) -> Router {
     let idx = addr_index::AddrIndex::open(label, path, &rpc.url, &rpc.user, &rpc.pass)
         .unwrap_or_else(|e| panic!("[{label}] address index failed to open: {e}"));

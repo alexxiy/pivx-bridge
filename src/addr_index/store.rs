@@ -316,6 +316,20 @@ impl Store {
             .map(|v| u32::from_le_bytes(v.value().try_into().unwrap_or([0; 4]))))
     }
 
+    /// The chain indexed (`getblockchaininfo.chain`), once recorded. An
+    /// index made before it was recorded has none.
+    pub fn chain(&self) -> StoreResult<Option<String>> {
+        let r = self.db.begin_read().map_err(e)?;
+        let meta = r.open_table(META).map_err(e)?;
+        Ok(meta.get("chain").map_err(e)?.map(|v| String::from_utf8_lossy(v.value()).into_owned()))
+    }
+
+    pub fn set_chain(&self, chain: &str) -> StoreResult<()> {
+        let w = self.db.begin_write().map_err(e)?;
+        w.open_table(META).map_err(e)?.insert("chain", chain.as_bytes()).map_err(e)?;
+        w.commit().map_err(e)
+    }
+
     pub fn block_info(&self, height: u32) -> StoreResult<Option<(String, u32)>> {
         let r = self.db.begin_read().map_err(e)?;
         let t = r.open_table(BLOCKS).map_err(e)?;
@@ -645,5 +659,27 @@ impl Store {
             r.open_table(OUTS).map_err(e)?.len().map_err(e)?,
             r.open_table(ADDR_STATS).map_err(e)?.len().map_err(e)?,
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_chain_is_recorded_across_reopens() {
+        let dir = std::env::temp_dir().join(format!("pivx-bridge-test-addr-chain-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("addr_index.redb").to_string_lossy().into_owned();
+
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.chain().unwrap(), None);
+        store.set_chain("regtest").unwrap();
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.chain().unwrap().as_deref(), Some("regtest"));
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

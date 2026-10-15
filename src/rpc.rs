@@ -10,6 +10,21 @@ pub struct RpcClient {
 /// Largest RPC answer read (a batch of verbose transactions can be big).
 const MAX_RESPONSE_BYTES: u64 = 256 * 1024 * 1024;
 
+/// JSON-RPC error code of a node that is still loading (RPC_IN_WARMUP).
+const RPC_IN_WARMUP: i64 = -28;
+/// How pivxd starts that error's message ("RPC in warm-up: Verifying
+/// blocks...").
+const IN_WARMUP: &str = "RPC in warm-up";
+/// How errors start when the node can't be reached at all.
+const UNREACHABLE: &str = "connection error";
+
+/// Whether `err` (from any call) only means the node isn't up yet: not
+/// listening, or still loading. Such errors pass; others, like a wrong RPC
+/// password, don't.
+pub fn node_starting(err: &str) -> bool {
+    err.starts_with(IN_WARMUP) || err.starts_with(UNREACHABLE)
+}
+
 impl RpcClient {
     pub fn new(url: &str, user: &str, pass: &str) -> Self {
         let agent = ureq::Agent::config_builder()
@@ -33,7 +48,7 @@ impl RpcClient {
             .header("Authorization", &self.auth)
             .header("Content-Type", "application/json")
             .send(body.to_string())
-            .map_err(|e| format!("connection error: {e}"))?;
+            .map_err(|e| format!("{UNREACHABLE}: {e}"))?;
         let status = resp.status();
         let text = resp
             .body_mut()
@@ -52,6 +67,11 @@ impl RpcClient {
     fn result_of(json: &Value) -> Result<Value, String> {
         if let Some(err) = json.get("error").filter(|e| !e.is_null()) {
             let msg = err.get("message").and_then(|m| m.as_str()).unwrap_or("unknown RPC error");
+            // node_starting() goes by the message: make sure a warm-up
+            // error says so whatever the node's wording.
+            if err.get("code").and_then(Value::as_i64) == Some(RPC_IN_WARMUP) && !msg.starts_with(IN_WARMUP) {
+                return Err(format!("{IN_WARMUP}: {msg}"));
+            }
             return Err(msg.to_string());
         }
         Ok(json.get("result").cloned().unwrap_or(Value::Null))
@@ -157,4 +177,35 @@ fn base64_encode(input: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn error(code: i64, message: &str) -> Value {
+        json!({ "result": null, "error": { "code": code, "message": message }, "id": 1 })
+    }
+
+    #[test]
+    fn warm_up_and_unreachable_mean_the_node_is_starting() {
+        // What pivxd answers while loading (HTTP 500).
+        let e = RpcClient::result_of(&error(-28, "RPC in warm-up: Verifying blocks...")).unwrap_err();
+        assert_eq!(e, "RPC in warm-up: Verifying blocks...");
+        assert!(node_starting(&e));
+        // Another wording still counts.
+        let e = RpcClient::result_of(&error(-28, "Loading block index...")).unwrap_err();
+        assert_eq!(e, "RPC in warm-up: Loading block index...");
+        assert!(node_starting(&e));
+        assert!(node_starting("connection error: io: Connection refused"));
+    }
+
+    #[test]
+    fn other_errors_are_not_waited_out() {
+        let e = RpcClient::result_of(&error(-32601, "Method not found")).unwrap_err();
+        assert!(!node_starting(&e));
+        assert!(!node_starting("HTTP 401: "));
+        assert!(!node_starting("JSON parse error: expected value"));
+        assert!(RpcClient::result_of(&json!({ "result": 5, "error": null })).is_ok());
+    }
 }

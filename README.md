@@ -54,7 +54,26 @@ cp .env.sample .env
 ./target/release/pivx-bridge
 ```
 
-The bridge scans from Sapling activation (block 2,700,501) on first run, then indexes new blocks in real-time via ZMQ. It answers requests while it catches up, from the blocks indexed so far.
+The bridge scans from Sapling activation (block 2,700,501) on first run, then indexes new blocks in real-time via ZMQ. It answers requests while it catches up, from the blocks indexed so far. It also starts while the node is still loading or not up yet (after a reboot, say): the indexers wait for the node and carry on when it answers.
+
+### As a systemd service
+
+```ini
+[Unit]
+Description=PIVX Bridge
+After=network-online.target pivxd.service
+
+[Service]
+WorkingDirectory=/var/lib/pivx-bridge
+ExecStart=/usr/local/bin/pivx-bridge
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+`WorkingDirectory` holds `.env` and the data files (see [Persistence](#persistence)). `RestartSec` keeps systemd from using up its restart limit in a second if the bridge does exit.
 
 ## PIVX Node Configuration
 
@@ -198,7 +217,7 @@ The bridge writes these files in the working directory (testnet: `shield.testnet
 
 - **`shield.bin`** — the PIVX-compat shield stream (append-only), served by byte range
 - **`shield.redb`** — per shield block, its offset in each stream format; the scan cursor; hashes of the last 1000 scanned blocks (exact reorg detection, also across restarts)
-- **`addr_index.redb`** — the transparent address index (only with `ADDR_INDEX=true`)
+- **`addr_index.redb`** — the transparent address index (only with `ADDR_INDEX=true`). It records which chain it indexes, so it opens without the node; if the node turns out to be on another chain (RPC pointed at the wrong network), the bridge exits instead of indexing it
 
 New blocks are appended to `shield.bin` and fsynced before one database transaction records them, so on startup `shield.bin` is simply cut back to the recorded length. Deleting `shield.redb` (or a database from an incompatible version) makes the bridge rebuild the shield data from scratch.
 
