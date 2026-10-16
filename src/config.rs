@@ -76,6 +76,12 @@ pub struct Config {
     #[arg(long, env = "ADDR_INDEX_PATH", default_value = "addr_index.redb")]
     pub addr_index_path: String,
 
+    /// Drop spent outputs from the address index once they're 1,000
+    /// blocks deep. Saves disk; details of transactions that spent them
+    /// then cost the node a call per input.
+    #[arg(long, env = "ADDR_INDEX_PRUNE")]
+    pub addr_index_prune: bool,
+
     /// Address index database path (testnet)
     #[arg(long, env = "TESTNET_ADDR_INDEX_PATH", default_value = "addr_index.testnet.redb")]
     pub testnet_addr_index_path: String,

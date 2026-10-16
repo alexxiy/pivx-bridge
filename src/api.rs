@@ -11,7 +11,6 @@ use axum::body::{Body, Bytes};
 use axum::extract::{Query, State};
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::Response;
-use axum::Json;
 use serde::Deserialize;
 
 use crate::block_cache::BlockCache;
@@ -182,14 +181,27 @@ impl StreamReader {
         }
         let n = self.left.min(CHUNK) as usize;
         let mut file = self.file.take()?;
+        let (format, mut carry) = (self.format, std::mem::take(&mut self.carry));
+        // Reading, and converting to a compact format, off the async workers.
         let read = tokio::task::spawn_blocking(move || {
             let mut buf = vec![0u8; n];
-            file.read_exact(&mut buf).map(|_| (file, buf))
+            file.read_exact(&mut buf)?;
+            let out = match format {
+                StreamFormat::PivxCompat => buf,
+                format => {
+                    carry.extend_from_slice(&buf);
+                    let complete = stream::complete_blocks_len(&carry);
+                    let out = stream::pivxcompat_to_compact(&carry[..complete], format);
+                    carry.drain(..complete);
+                    out
+                }
+            };
+            Ok((file, out, carry))
         })
         .await
         .map_err(std::io::Error::other)
         .and_then(|r| r);
-        let (file, buf) = match read {
+        let (file, out, carry) = match read {
             Ok(v) => v,
             Err(e) => return Some((Err(e), None)),
         };
@@ -198,18 +210,9 @@ impl StreamReader {
             return Some((Err(std::io::Error::other("shield data changed (chain reorganisation), retry")), None));
         }
         self.file = Some(file);
+        self.carry = carry;
         self.left -= n as u64;
-        let out = match self.format {
-            StreamFormat::PivxCompat => Bytes::from(buf),
-            format => {
-                self.carry.extend_from_slice(&buf);
-                let complete = stream::complete_blocks_len(&self.carry);
-                let out = stream::pivxcompat_to_compact(&self.carry[..complete], format);
-                self.carry.drain(..complete);
-                Bytes::from(out)
-            }
-        };
-        Some((Ok(out), Some(self)))
+        Some((Ok(Bytes::from(out)), Some(self)))
     }
 }
 
@@ -313,8 +316,11 @@ pub async fn get_block_count(State(state): State<Arc<AppState>>) -> Result<Strin
 // ---------------------------------------------------------------------------
 
 /// Return a JSON array of all shield block heights.
-pub async fn get_shield_blocks(State(state): State<Arc<AppState>>) -> Result<Json<Vec<u32>>, (StatusCode, String)> {
-    blocking(move || state.store.heights().map(Json).map_err(internal)).await
+pub async fn get_shield_blocks(State(state): State<Arc<AppState>>) -> Result<Response, (StatusCode, String)> {
+    let json = blocking(move || state.store.heights_json().map_err(internal)).await?;
+    let mut resp = Response::new(Body::from(json));
+    resp.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    Ok(resp)
 }
 
 // ---------------------------------------------------------------------------

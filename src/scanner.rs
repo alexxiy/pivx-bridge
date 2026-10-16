@@ -119,6 +119,176 @@ pub fn scan_block_json(block_json: &serde_json::Value) -> Result<Option<ShieldBl
     Ok((!txs.is_empty()).then_some(ShieldBlock { height, time, txs }))
 }
 
+/// What the shield index needs of a raw block (`getblock <hash> 0`).
+#[derive(Debug)]
+pub struct RawBlockScan {
+    /// Display-order hex, as RPC answers show them.
+    pub hash: String,
+    pub prev_hash: String,
+    /// `None` when the block has no shield transactions.
+    pub shield: Option<ShieldBlock>,
+}
+
+/// Reads a raw block at `height`: its hash, its parent and its shield
+/// transactions. A raw block costs the node far less than the JSON of
+/// `getblock <hash> 2`, and shield data needs only the raw transactions.
+///
+/// The transactions found must hash to the header's merkle root, so a
+/// block this reader gets wrong is an error, never wrong shield data.
+pub fn scan_raw_block(height: u32, block: &[u8]) -> Result<RawBlockScan, String> {
+    let mut r = Reader { data: block, pos: 0 };
+    // PIVX Core's CBlockHeader.
+    let version = r.u32()?;
+    if version < 4 {
+        // Hashed with Quark (pre-2018 blocks).
+        return Err(format!("block version {version}"));
+    }
+    let prev = r.take(32)?.to_vec();
+    let merkle_root = r.take(32)?.to_vec();
+    let time = r.u32()?;
+    r.take(8)?; // nBits, nNonce
+    if version < 7 {
+        r.take(32)?; // nAccumulatorCheckpoint
+    }
+    if version >= 8 {
+        r.take(32)?; // hashFinalSaplingRoot
+    }
+    let hash = sha256d(&block[..r.pos]);
+
+    let count = r.compact_size()?;
+    let mut txids = Vec::with_capacity(count.min(block.len() / 60));
+    let mut txs = Vec::new();
+    for _ in 0..count {
+        let start = r.pos;
+        skip_tx(&mut r)?;
+        let raw = &block[start..r.pos];
+        txids.push(sha256d(raw));
+        if raw.starts_with(&[0x03, 0x00]) {
+            match parse_sapling_tx(raw) {
+                Ok(Some(compact)) => txs.push(ShieldTx { raw: raw.to_vec(), compact: Some(compact) }),
+                Ok(None) => {}
+                Err(e) => return Err(format!("tx {}: {e}", display_hex(txids.last().unwrap()))),
+            }
+        }
+    }
+    if txids.is_empty() || merkle(txids)[..] != merkle_root[..] {
+        return Err("the transactions don't match the merkle root".into());
+    }
+    // What's left is a proof-of-stake block's signature.
+    if r.pos < block.len() {
+        let len = r.compact_size()?;
+        r.take(len)?;
+        if r.pos != block.len() {
+            return Err(format!("{} bytes after the block", block.len() - r.pos));
+        }
+    }
+
+    Ok(RawBlockScan {
+        hash: display_hex(&hash),
+        prev_hash: display_hex(&prev),
+        shield: (!txs.is_empty()).then_some(ShieldBlock { height, time, txs }),
+    })
+}
+
+/// Moves `r` past one transaction, as PIVX Core's SerializeTransaction
+/// writes it.
+fn skip_tx(r: &mut Reader) -> Result<(), String> {
+    let version = r.u16()?;
+    let n_type = r.u16()?;
+    for _ in 0..r.compact_size()? {
+        r.take(36)?; // prevout
+        let script = r.compact_size()?;
+        r.take(script)?;
+        r.take(4)?; // nSequence
+    }
+    for _ in 0..r.compact_size()? {
+        r.take(8)?; // nValue
+        let script = r.compact_size()?;
+        r.take(script)?;
+    }
+    r.take(4)?; // nLockTime
+    if version >= 3 {
+        // Optional<SaplingTxData>
+        if r.flag()? {
+            r.take(8)?; // valueBalance
+            let spends = r.compact_size()?;
+            r.take(spends.checked_mul(SPEND_DESC_SIZE).ok_or("too many spends")?)?;
+            let outputs = r.compact_size()?;
+            r.take(outputs.checked_mul(OUTPUT_DESC_SIZE).ok_or("too many outputs")?)?;
+            r.take(64)?; // bindingSig
+        }
+        // Optional<std::vector<uint8_t>> extraPayload of special txs
+        if n_type != 0 && r.flag()? {
+            let len = r.compact_size()?;
+            r.take(len)?;
+        }
+    }
+    Ok(())
+}
+
+struct Reader<'a> {
+    data: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Reader<'a> {
+    fn take(&mut self, n: usize) -> Result<&'a [u8], String> {
+        let end = self.pos.checked_add(n).filter(|&e| e <= self.data.len()).ok_or("truncated block")?;
+        let out = &self.data[self.pos..end];
+        self.pos = end;
+        Ok(out)
+    }
+
+    fn u16(&mut self) -> Result<u16, String> {
+        Ok(u16::from_le_bytes(self.take(2)?.try_into().unwrap()))
+    }
+
+    fn u32(&mut self) -> Result<u32, String> {
+        Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
+    }
+
+    fn flag(&mut self) -> Result<bool, String> {
+        match self.take(1)?[0] {
+            0 => Ok(false),
+            1 => Ok(true),
+            b => Err(format!("bad Optional flag {b}")),
+        }
+    }
+
+    fn compact_size(&mut self) -> Result<usize, String> {
+        let (n, len) = read_compact_size(self.data, self.pos)?;
+        self.pos += len;
+        Ok(n)
+    }
+}
+
+fn sha256d(data: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(Sha256::digest(data)).into()
+}
+
+/// Bitcoin's merkle root: pairs hashed level by level, an odd last hash
+/// paired with itself.
+fn merkle(mut level: Vec<[u8; 32]>) -> [u8; 32] {
+    while level.len() > 1 {
+        level = level
+            .chunks(2)
+            .map(|pair| {
+                let mut both = [0u8; 64];
+                both[..32].copy_from_slice(&pair[0]);
+                both[32..].copy_from_slice(pair.get(1).unwrap_or(&pair[0]));
+                sha256d(&both)
+            })
+            .collect();
+    }
+    level[0]
+}
+
+/// Hash bytes in RPC display order (reversed) as hex.
+fn display_hex(hash: &[u8]) -> String {
+    hash.iter().rev().map(|b| format!("{b:02x}")).collect()
+}
+
 // ---------------------------------------------------------------------------
 // PIVX Sapling transaction parser
 // ---------------------------------------------------------------------------
@@ -493,5 +663,83 @@ mod tests {
         assert_eq!(compact.outputs[0].epk[0], 0x33);
         assert_eq!(compact.outputs[0].enc_ciphertext[0], 0x44);
         assert_eq!(compact.outputs[0].out_ciphertext[0], 0x55);
+    }
+
+    /// A regtest block (version 11) with a coinbase, a coinstake, a shield
+    /// transaction and a transparent one, as `getblock <hash> 0` gave it.
+    const REGTEST_BLOCK: &str = include_str!("../tests/regtest_shield_block.hex");
+
+    #[test]
+    fn raw_block_from_the_node() {
+        let block = hex::hex_decode(REGTEST_BLOCK.trim()).unwrap();
+        let scan = scan_raw_block(16402, &block).unwrap();
+        assert_eq!(scan.hash, "bf0dd46974cfea4b9feaf2647b49b8a343797bcce9f345d285fcf0a74248bbd8");
+        assert_eq!(scan.prev_hash, "efeedac6192d1adfef663eb8a17b93cdea06e8d178a6f6bf049b97e62fb05997");
+        let shield = scan.shield.unwrap();
+        assert_eq!((shield.height, shield.time), (16402, 1792146473));
+        assert_eq!(shield.txs.len(), 1);
+        assert!(shield.txs[0].raw.starts_with(&[0x03, 0x00]));
+        assert!(!shield.txs[0].compact.as_ref().unwrap().outputs.is_empty());
+
+        // A changed byte in a transaction no longer matches the merkle root.
+        let mut changed = block.clone();
+        let at = changed.len() - 200;
+        changed[at] ^= 1;
+        assert!(scan_raw_block(16402, &changed).is_err());
+        // Nor do extra bytes, or a cut block.
+        let mut longer = block.clone();
+        longer.push(0);
+        assert!(scan_raw_block(16402, &longer).is_err());
+        assert!(scan_raw_block(16402, &block[..block.len() - 1]).is_err());
+    }
+
+    /// A version 8+ block of `txs`, with a block signature.
+    fn raw_block(version: u32, txs: &[Vec<u8>]) -> Vec<u8> {
+        let mut b = version.to_le_bytes().to_vec();
+        b.extend([0x11; 32]); // hashPrevBlock
+        b.extend(merkle(txs.iter().map(|t| sha256d(t)).collect()));
+        b.extend(7u32.to_le_bytes()); // nTime
+        b.extend([0u8; 8]);
+        b.extend([0u8; 32]); // hashFinalSaplingRoot
+        b.push(txs.len() as u8);
+        for t in txs {
+            b.extend(t);
+        }
+        b.push(3);
+        b.extend([0xAA, 0xBB, 0xCC]); // vchBlockSig
+        b
+    }
+
+    #[test]
+    fn raw_block_with_mainnet_and_special_transactions() {
+        let mainnet = hex::hex_decode(include_str!("../tests/mainnet_sapling_tx.hex").trim()).unwrap();
+        // v1 coinbase-like: 1 input with a script, 1 output.
+        let mut v1 = vec![0x01, 0, 0, 0, 1];
+        v1.extend([0u8; 36]);
+        v1.extend([2, 0x51, 0x52]);
+        v1.extend([0xff; 4]);
+        v1.push(1);
+        v1.extend(5u64.to_le_bytes());
+        v1.extend([1, 0x51]);
+        v1.extend([0u8; 4]);
+        let proreg = shield_tx(1, &[0x01, 0x03, 0xAA, 0xBB, 0xCC]);
+        // A special tx without shield data but with a payload.
+        let mut no_shield = vec![0x03, 0x00, 0x02, 0x00, 0, 0, 0, 0, 0, 0, 0x00];
+        no_shield.extend([0x01, 0x02, 0xAA, 0xBB]);
+        let block = raw_block(11, &[v1, mainnet.clone(), no_shield, proreg.clone()]);
+        let scan = scan_raw_block(5, &block).unwrap();
+        assert_eq!(scan.prev_hash, "11".repeat(32));
+        let shield = scan.shield.unwrap();
+        assert_eq!(shield.txs.len(), 2);
+        assert_eq!(shield.txs[0].raw, mainnet);
+        assert_eq!(shield.txs[0].compact.as_ref().unwrap().nullifiers.len(), 2);
+        assert_eq!(shield.txs[1].raw, proreg);
+        assert_eq!(scan.hash, display_hex(&sha256d(&block[..80 + 32])));
+
+        // Without the signature too (a proof-of-work block).
+        let unsigned = &block[..block.len() - 4];
+        assert_eq!(scan_raw_block(5, unsigned).unwrap().shield.unwrap().txs.len(), 2);
+        // Old Quark-hashed blocks are left to the JSON path.
+        assert!(scan_raw_block(5, &raw_block(3, &[mainnet])).is_err());
     }
 }

@@ -12,25 +12,25 @@ pub mod mempool;
 pub mod store;
 pub mod xpub;
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{mpsc, Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
-use serde_json::Value;
+use serde_json::{json, Value};
 
+use crate::fetch::Fetcher;
 use crate::rpc::RpcClient;
+use crate::shield_sync::RpcConfig;
 use crate::shutdown;
 use mempool::Mempool;
-use store::{Store, Txid};
+use store::{IndexBlock, Store, Txid};
 
 /// Blocks behind the node tip for which rollback data is kept.
 const UNDO_WINDOW: u32 = 1_000;
 /// Parallel block fetchers used during catch-up (see the shield indexer's
 /// FETCH_WORKERS for why 4).
 const FETCH_WORKERS: usize = 4;
-/// How far the fetchers may get ahead of the block being stored.
-const LOOKAHEAD: u32 = 1_000;
 /// Blocks per write transaction during catch-up.
 const CATCHUP_BATCH: u32 = 500;
 
@@ -52,34 +52,43 @@ impl NetParams {
     }
 }
 
-/// Small LRU for verbose tx JSON (confirmed txs are immutable).
+/// Recent verbose transactions from the node, trimmed to what the API
+/// reads of them (`api::trim_tx`), oldest dropped first. A transaction
+/// never changes, so entries stay valid across reorgs.
 pub struct TxCache {
-    map: HashMap<Txid, Value>,
+    map: HashMap<Txid, (Arc<Value>, usize)>,
     order: VecDeque<Txid>,
-    cap: usize,
+    /// Estimated bytes held.
+    bytes: usize,
 }
 
 impl TxCache {
-    fn new(cap: usize) -> Self {
-        Self { map: HashMap::new(), order: VecDeque::new(), cap }
+    const MAX_TXS: usize = 20_000;
+    const MAX_BYTES: usize = 64 << 20;
+
+    fn new() -> Self {
+        Self { map: HashMap::new(), order: VecDeque::new(), bytes: 0 }
     }
-    pub fn get(&self, t: &Txid) -> Option<Value> {
-        self.map.get(t).cloned()
+    pub fn get(&self, t: &Txid) -> Option<Arc<Value>> {
+        self.map.get(t).map(|(v, _)| v.clone())
     }
     pub fn contains(&self, t: &Txid) -> bool {
         self.map.contains_key(t)
     }
-    pub fn put(&mut self, t: Txid, v: Value) {
+    /// Adds `t`, of about `size` bytes.
+    pub fn put(&mut self, t: Txid, v: Arc<Value>, size: usize) {
         if self.map.contains_key(&t) {
             return;
         }
-        if self.map.len() >= self.cap {
-            if let Some(old) = self.order.pop_front() {
-                self.map.remove(&old);
+        self.order.push_back(t);
+        self.map.insert(t, (v, size));
+        self.bytes += size;
+        while self.map.len() > Self::MAX_TXS || self.bytes > Self::MAX_BYTES {
+            let Some(old) = self.order.pop_front() else { break };
+            if let Some((_, n)) = self.map.remove(&old) {
+                self.bytes -= n;
             }
         }
-        self.order.push_back(t);
-        self.map.insert(t, v);
     }
 }
 
@@ -110,8 +119,18 @@ impl HistoryCache {
     }
 }
 
-/// Derived-address cache per xpub: chain -> addresses[index].
-pub type XpubCache = HashMap<String, [Vec<String>; 2]>;
+/// Derived addresses per xpub: chain -> addresses[index].
+#[derive(Default)]
+pub struct XpubCache {
+    pub map: HashMap<String, [Vec<String>; 2]>,
+    /// Addresses held, all xpubs together.
+    pub addresses: usize,
+}
+
+impl XpubCache {
+    /// Addresses kept before the cache starts over (about 60 bytes each).
+    pub const MAX_ADDRESSES: usize = 200_000;
+}
 
 /// What `/watch` waits on: indexed tip and mempool sequence.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -171,13 +190,12 @@ impl AddrIndex {
     pub fn open(
         label: &'static str,
         path: &str,
-        rpc_url: &str,
-        user: &str,
-        pass: &str,
+        rpc: &RpcConfig,
+        prune: bool,
         node_calls: Arc<tokio::sync::Semaphore>,
     ) -> Result<Arc<Self>, String> {
-        let rpc = RpcClient::new(rpc_url, user, pass);
-        let store = Store::open(path)?;
+        let rpc = rpc.client();
+        let store = Store::open(path, prune)?;
         let chain = match store.chain()? {
             Some(chain) => chain,
             None => {
@@ -207,8 +225,8 @@ impl AddrIndex {
             in_sync: AtomicBool::new(false),
             node_behind: AtomicBool::new(false),
             node_calls,
-            tx_cache: Mutex::new(TxCache::new(20_000)),
-            xpub_cache: Mutex::new(HashMap::new()),
+            tx_cache: Mutex::new(TxCache::new()),
+            xpub_cache: Mutex::new(XpubCache::default()),
             history_cache: Mutex::new(HistoryCache { entries: VecDeque::new() }),
             changes: tokio::sync::watch::Sender::new(initial),
         }))
@@ -219,17 +237,17 @@ impl AddrIndex {
     }
 
     /// Spawn the indexer thread (catch-up, follow tip, mempool).
-    pub fn spawn(self: &Arc<Self>, rpc_url: String, user: String, pass: String) {
+    pub fn spawn(self: &Arc<Self>, cfg: RpcConfig) {
         let idx = self.clone();
         let thread = std::thread::Builder::new()
             .name(format!("addr-index-{}", self.label))
             .spawn(move || {
-                let rpc = RpcClient::new(&rpc_url, &user, &pass);
+                let rpc = cfg.client();
                 if !idx.check_chain(&rpc) {
                     return;
                 }
                 while !shutdown::stopping() {
-                    if let Err(e) = idx.sync_blocks(&rpc_url, &user, &pass, &rpc) {
+                    if let Err(e) = idx.sync_blocks(&cfg, &rpc) {
                         if !shutdown::stopping() {
                             log::warn!("[{}] addr-index: {e} — retrying", idx.label);
                         }
@@ -279,7 +297,7 @@ impl AddrIndex {
     }
 
     /// Bring the index to the node tip, rolling back on reorgs.
-    fn sync_blocks(&self, rpc_url: &str, user: &str, pass: &str, rpc: &RpcClient) -> Result<(), String> {
+    fn sync_blocks(&self, cfg: &RpcConfig, rpc: &RpcClient) -> Result<(), String> {
         let node_tip = rpc.get_block_count()? as u32;
         self.node_tip.store(node_tip, Ordering::Relaxed);
 
@@ -295,9 +313,10 @@ impl AddrIndex {
         if behind != self.node_behind.swap(behind, Ordering::Relaxed) {
             if behind {
                 log::info!("[{}] The node is at block {node_tip}, behind the address index (block {}): waiting for it", self.label, self.store.tip()?.unwrap_or(0));
-            } else {
+            } else if Some(node_tip) >= self.store.tip()? {
                 log::info!("[{}] The node caught up with the address index", self.label);
             }
+            // Otherwise the node is on another branch: the reorg is logged.
         }
         if behind {
             self.in_sync.store(false, Ordering::Relaxed);
@@ -308,16 +327,23 @@ impl AddrIndex {
         // node's; we store every block hash so the fork is exact. An RPC
         // error stops the pass: taken for a different hash, it would undo
         // good blocks.
-        while let Some(tip) = self.store.tip()? {
-            let stored = self.store.block_info(tip)?.map(|(h, _)| h).unwrap_or_default();
-            let on_chain = if tip <= node_tip { Some(rpc.get_block_hash(tip)?) } else { None };
-            if on_chain.as_deref() == Some(stored.as_str()) {
-                break;
+        let mut undone = None;
+        let result = (|| {
+            while let Some(tip) = self.store.tip()? {
+                let stored = self.store.block_info(tip)?.map(|(h, _)| h).unwrap_or_default();
+                let on_chain = if tip <= node_tip { Some(rpc.get_block_hash(tip)?) } else { None };
+                if on_chain.as_deref() == Some(stored.as_str()) {
+                    break;
+                }
+                let block = self.store.undo_tip()?;
+                undone = Some((block, undone.map_or(block, |(_, top)| top)));
             }
-            let undone = self.store.undo_tip()?;
-            self.tx_cache.lock().unwrap().map.clear();
-            log::info!("[{}] addr-index: reorg — rolled back block {undone}", self.label);
+            Ok::<(), String>(())
+        })();
+        if let Some((low, high)) = undone {
+            log::info!("[{}] Address index: reorg, rolled back blocks {low}..{high}", self.label);
         }
+        result?;
 
         let from = self.store.tip()?.map(|t| t + 1).unwrap_or(0);
         if from > node_tip {
@@ -329,63 +355,23 @@ impl AddrIndex {
             self.in_sync.store(false, Ordering::Relaxed);
             log::info!("[{}] addr-index: catching up {from}..{node_tip} ({behind} blocks)", self.label);
         }
-        self.catch_up(rpc_url, user, pass, from, node_tip)?;
+        self.catch_up(cfg, from, node_tip)?;
         self.in_sync.store(self.store.tip()? == Some(node_tip), Ordering::Relaxed);
         Ok(())
     }
 
-    fn catch_up(&self, rpc_url: &str, user: &str, pass: &str, from: u32, to: u32) -> Result<(), String> {
+    fn catch_up(&self, cfg: &RpcConfig, from: u32, to: u32) -> Result<(), String> {
         let count = to - from + 1;
         let workers = if count > 50 { FETCH_WORKERS } else { 1 };
-        let next = Arc::new(AtomicU32::new(from));
-        // The block being stored; fetchers stay within LOOKAHEAD of it.
-        let stored = Arc::new(AtomicU32::new(from));
-        let stop = Arc::new(AtomicBool::new(false));
-        let (tx, rx) = mpsc::sync_channel::<(u32, Result<Value, String>)>(256);
-        let mut handles = Vec::new();
-        for _ in 0..workers {
-            let next = next.clone();
-            let stored = stored.clone();
-            let stop = stop.clone();
-            let tx = tx.clone();
-            let (u, us, p) = (rpc_url.to_string(), user.to_string(), pass.to_string());
-            handles.push(std::thread::spawn(move || {
-                let rpc = RpcClient::new(&u, &us, &p);
-                let stopped = || stop.load(Ordering::SeqCst) || shutdown::stopping();
-                loop {
-                    if stopped() {
-                        break;
-                    }
-                    let h = next.fetch_add(1, Ordering::SeqCst);
-                    if h > to {
-                        break;
-                    }
-                    while h > stored.load(Ordering::SeqCst) + LOOKAHEAD && !stopped() {
-                        std::thread::sleep(Duration::from_millis(20));
-                    }
-                    let mut res = Err(String::new());
-                    for attempt in 0..3 {
-                        res = rpc.get_block_hash(h).and_then(|hash| rpc.get_block(&hash, 2));
-                        if res.is_ok() || stopped() {
-                            break;
-                        }
-                        std::thread::sleep(Duration::from_millis(500 * (attempt + 1)));
-                    }
-                    if tx.send((h, res)).is_err() {
-                        break;
-                    }
-                }
-            }));
-        }
-        drop(tx);
+        let mut blocks = Fetcher::start(cfg, from, to, workers, |rpc, h| {
+            IndexBlock::from_json(&rpc.get_block(&rpc.get_block_hash(h)?, 2)?)
+        });
 
         let mut prev_hash: Option<String> = if from == 0 {
             None
         } else {
             self.store.block_info(from - 1)?.map(|(h, _)| h)
         };
-        let mut buffer: BTreeMap<u32, Result<Value, String>> = BTreeMap::new();
-        let mut expect = from;
         let mut w = self.store.begin_write()?;
         let mut in_txn = 0u32;
         let started = Instant::now();
@@ -393,73 +379,52 @@ impl AddrIndex {
         let near_tip = |h: u32| h + UNDO_WINDOW > to;
         let mut result = Ok(());
 
-        'outer: for (h, r) in rx.iter() {
-            if shutdown::stopping() {
+        while let Some((height, r)) = blocks.next() {
+            let block = match r {
+                Ok(b) => b,
+                Err(e) => {
+                    result = Err(format!("fetch block {height}: {e}"));
+                    break;
+                }
+            };
+            if let Some(ph) = &prev_hash {
+                if block.prev_hash.as_ref() != Some(ph) {
+                    // Chain moved under us — stop; the next pass
+                    // runs reorg detection from the committed tip.
+                    result = Err(format!("chain changed at {height} during catch-up"));
+                    break;
+                }
+            }
+            if let Err(e) = self.store.apply_block(&w, &block, near_tip(height)) {
+                result = Err(format!("apply block {height}: {e}"));
                 break;
             }
-            buffer.insert(h, r);
-            while let Some(r) = buffer.remove(&expect) {
-                let block = match r {
-                    Ok(b) => b,
-                    Err(e) => {
-                        result = Err(format!("fetch block {expect}: {e}"));
-                        break 'outer;
-                    }
-                };
-                if let Some(ph) = &prev_hash {
-                    if block["previousblockhash"].as_str() != Some(ph.as_str()) {
-                        // Chain moved under us — stop; the next pass
-                        // runs reorg detection from the committed tip.
-                        result = Err(format!("chain changed at {expect} during catch-up"));
-                        break 'outer;
-                    }
+            prev_hash = Some(block.hash);
+            let next = height + 1;
+            in_txn += 1;
+            let batch = if near_tip(next) { 1 } else { CATCHUP_BATCH };
+            if in_txn >= batch {
+                if next.is_multiple_of(100) {
+                    self.store.prune_undo(&w, to.saturating_sub(UNDO_WINDOW))?;
                 }
-                if let Err(e) = self.store.apply_block(&w, &block, near_tip(expect)) {
-                    result = Err(format!("apply block {expect}: {e}"));
-                    break 'outer;
-                }
-                prev_hash = block["hash"].as_str().map(|s| s.to_string());
-                expect += 1;
-                stored.store(expect, Ordering::SeqCst);
-                in_txn += 1;
-                let batch = if near_tip(expect) { 1 } else { CATCHUP_BATCH };
-                if in_txn >= batch {
-                    if expect.is_multiple_of(100) {
-                        self.store.prune_undo(&w, to.saturating_sub(UNDO_WINDOW))?;
-                    }
-                    w.commit().map_err(|e| e.to_string())?;
-                    w = self.store.begin_write()?;
-                    in_txn = 0;
-                }
-                if last_log.elapsed() > Duration::from_secs(30) {
-                    let done = expect - from;
-                    let rate = done as f64 / started.elapsed().as_secs_f64().max(0.001);
-                    let eta = (to + 1 - expect) as f64 / rate.max(0.001);
-                    log::info!(
-                        "[{}] addr-index: {}/{} ({rate:.0} blk/s, ETA {:.0} min)",
-                        self.label,
-                        expect - 1,
-                        to,
-                        eta / 60.0
-                    );
-                    last_log = Instant::now();
-                }
+                w.commit().map_err(|e| e.to_string())?;
+                w = self.store.begin_write()?;
+                in_txn = 0;
+            }
+            if last_log.elapsed() > Duration::from_secs(30) {
+                let done = next - from;
+                let rate = done as f64 / started.elapsed().as_secs_f64().max(0.001);
+                let eta = (to - height) as f64 / rate.max(0.001);
+                log::info!("[{}] addr-index: {height}/{to} ({rate:.0} blk/s, ETA {:.0} min)", self.label, eta / 60.0);
+                last_log = Instant::now();
             }
         }
         // Abort outstanding fetchers before committing.
-        stop.store(true, Ordering::SeqCst);
-        drop(rx);
+        blocks.finish();
         if in_txn > 0 {
             w.commit().map_err(|e| e.to_string())?;
         } else {
             w.abort().map_err(|e| e.to_string())?;
-        }
-        // When stopping, a fetcher may still wait on the node: don't wait
-        // for it, the blocks stored so far are committed.
-        if !shutdown::stopping() {
-            for h in handles {
-                let _ = h.join();
-            }
         }
         if count > 10 && result.is_ok() && !shutdown::stopping() {
             log::info!(
@@ -500,10 +465,15 @@ impl AddrIndex {
                 .cloned()
                 .collect()
         };
+        // In batches: after a restart the whole mempool is new.
         let mut fetched: HashMap<String, Value> = HashMap::new();
-        for t in unknown {
-            if let Ok(v) = rpc.get_raw_transaction(&t, true) {
-                fetched.insert(t, v);
+        for chunk in unknown.chunks(100) {
+            let params: Vec<Vec<Value>> = chunk.iter().map(|t| vec![json!(t), json!(true)]).collect();
+            // A tx gone from the mempool meanwhile answers an error: skip it.
+            for (t, answer) in chunk.iter().zip(rpc.batch("getrawtransaction", &params)?) {
+                if let Ok(v) = answer {
+                    fetched.insert(t.clone(), v);
+                }
             }
         }
         let mut mp = self.mempool.write().unwrap();

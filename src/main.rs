@@ -7,6 +7,7 @@ mod api;
 mod block_cache;
 mod config;
 mod db;
+mod fetch;
 mod hex;
 mod logging;
 mod proxy;
@@ -17,7 +18,6 @@ mod shield_sync;
 mod shutdown;
 mod stream;
 
-use std::future::IntoFuture;
 use std::sync::atomic::{AtomicBool, AtomicU32};
 use std::sync::{mpsc, Arc, Mutex, RwLock};
 use std::time::Duration;
@@ -70,7 +70,7 @@ fn start_network(cfg: NetworkConfig, config: &config::Config) -> Router {
         store,
         allowed_rpcs: config.allowed_rpc_set(),
         hash_cache: RwLock::new(api::HashCache::new(1000)),
-        block_cache: RwLock::new(block_cache::BlockCache::new(1000)),
+        block_cache: RwLock::new(block_cache::BlockCache::new(1000, 64 << 20)),
         chain_height: AtomicU32::new(0),
         node_behind: AtomicBool::new(false),
         jq: proxy::JqPolicy::new(config.jq_filters),
@@ -101,7 +101,7 @@ fn start_network(cfg: NetworkConfig, config: &config::Config) -> Router {
     if let Some(path) = cfg.addr_index_path {
         let slot = Arc::new(AddrSlot::new());
         routes = routes.merge(addr_index::api::routes(slot.clone()));
-        start_addr_index(label, path, cfg.rpc, node_calls, slot);
+        start_addr_index(label, path, cfg.rpc, config.addr_index_prune, node_calls, slot);
     }
     routes
 }
@@ -161,13 +161,14 @@ fn start_addr_index(
     label: &'static str,
     path: String,
     rpc: RpcConfig,
+    prune: bool,
     node_calls: Arc<tokio::sync::Semaphore>,
     slot: Arc<AddrSlot>,
 ) {
     std::thread::Builder::new()
         .name(format!("addr-open-{label}"))
         .spawn(move || {
-            let idx = match addr_index::AddrIndex::open(label, &path, &rpc.url, &rpc.user, &rpc.pass, node_calls) {
+            let idx = match addr_index::AddrIndex::open(label, &path, &rpc, prune, node_calls) {
                 Ok(idx) => idx,
                 Err(_) if shutdown::stopping() => return,
                 Err(e) => {
@@ -175,7 +176,7 @@ fn start_addr_index(
                     std::process::exit(1);
                 }
             };
-            idx.spawn(rpc.url, rpc.user, rpc.pass);
+            idx.spawn(rpc);
             let _ = slot.set(idx);
             log::info!("[{label}] Address index: enabled");
         })
@@ -243,14 +244,14 @@ async fn main() {
 
     let app = if config.no_compression {
         log::info!("Compression: off");
-        app.into_make_service()
+        app
     } else {
         // Shield data and Sapling params are random-looking (gzip saves
         // under 2 %) and large: compressing them only costs CPU and delays
         // the first byte. JSON answers are compressed.
         log::info!("Compression: gzip for JSON (NO_COMPRESSION=true turns it off)");
         let predicate = DefaultPredicate::new().and(NotForContentType::const_new("application/octet-stream"));
-        app.layer(CompressionLayer::new().compress_when(predicate)).into_make_service()
+        app.layer(CompressionLayer::new().compress_when(predicate))
     };
 
     let mut servers = Vec::new();
@@ -258,12 +259,12 @@ async fn main() {
         let addr = std::net::SocketAddr::new(*ip, config.port);
         let listener = bind(addr).unwrap_or_else(|e| panic!("failed to listen on {addr}: {e}"));
         log::info!("Listening on http://{addr}");
-        servers.push(tokio::spawn(axum::serve(listener, app.clone()).into_future()));
+        servers.push(tokio::spawn(serve(listener, app.clone())));
     }
     tokio::select! {
         results = futures::future::join_all(servers) => {
             for result in results {
-                result.expect("server task failed").expect("server error");
+                result.expect("server task failed");
             }
         }
         () = shutdown::signal() => {}
@@ -278,6 +279,53 @@ async fn main() {
         log::warn!("Stopped while an indexer was still waiting on the node (what it stored is saved)");
     }
     std::process::exit(0);
+}
+
+/// How long a client may take to send a request's headers, and how long
+/// an idle kept-alive connection stays open.
+const HEADER_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a request body may stall between two pieces.
+const BODY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Serves `app` on `listener`. Unlike `axum::serve`, with timeouts: a
+/// connection that doesn't send its request (slowly or not at all) is
+/// closed, so clients can't hold connections open forever when the
+/// bridge isn't behind nginx.
+async fn serve(listener: tokio::net::TcpListener, app: Router) {
+    use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
+    use hyper_util::server::conn::auto::Builder;
+    use hyper_util::service::TowerToHyperService;
+    use std::io::ErrorKind;
+    use tower_http::timeout::RequestBodyTimeout;
+
+    let mut builder = Builder::new(TokioExecutor::new());
+    builder.http1().timer(TokioTimer::new()).header_read_timeout(HEADER_TIMEOUT);
+    builder.http2().timer(TokioTimer::new()).keep_alive_interval(HEADER_TIMEOUT);
+    let builder = Arc::new(builder);
+    loop {
+        let stream = match listener.accept().await {
+            Ok((stream, _)) => stream,
+            Err(e) if matches!(e.kind(), ErrorKind::ConnectionAborted | ErrorKind::ConnectionReset) => continue,
+            Err(e) => {
+                // Out of file descriptors and the like: wait, don't spin.
+                log::warn!("Accepting a connection failed: {e}");
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
+            }
+        };
+        let _ = stream.set_nodelay(true);
+        let service = TowerToHyperService::new(RequestBodyTimeout::new(app.clone(), BODY_TIMEOUT));
+        let builder = builder.clone();
+        tokio::spawn(async move {
+            // hyper's timeout runs once a request starts; telling HTTP/1
+            // from HTTP/2 waits for the first byte without one.
+            let mut first = [0u8; 1];
+            if !matches!(tokio::time::timeout(HEADER_TIMEOUT, stream.peek(&mut first)).await, Ok(Ok(1))) {
+                return;
+            }
+            let _ = builder.serve_connection_with_upgrades(TokioIo::new(stream), service).await;
+        });
+    }
 }
 
 /// A listening socket on [addr]. IPv6 ones take IPv6 only, so `0.0.0.0`

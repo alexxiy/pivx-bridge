@@ -23,7 +23,7 @@ use serde_json::{json, Value};
 
 use super::store::{addr_hash, txid_from_hex, txid_to_hex, value_to_sats, Txid, FLAG_COINBASE, FLAG_COINSTAKE};
 use super::xpub::{is_xpub, ExtendedPubKey};
-use super::AddrIndex;
+use super::{AddrIndex, XpubCache};
 
 const DEFAULT_PAGE_SIZE: usize = 1000;
 const MAX_PAGE_SIZE: usize = 1000;
@@ -178,25 +178,55 @@ async fn block_index(State(slot): State<Arc<AddrSlot>>, Path(height): Path<u32>)
 // Transactions
 // ---------------------------------------------------------------------------
 
+/// What `tx_json` reads of a verbose transaction, and about how many
+/// bytes that holds: decoded scripts and shield descriptions, most of
+/// the answer, are left out.
+pub(super) fn trim_tx(raw: &Value) -> (Value, usize) {
+    let pick = |v: &Value, keys: &[&str]| -> Value {
+        Value::Object(keys.iter().filter_map(|k| Some((k.to_string(), v.get(*k)?.clone()))).collect())
+    };
+    let list = |key: &str| raw[key].as_array().map(Vec::as_slice).unwrap_or_default();
+    let vin: Vec<Value> = list("vin").iter().map(|i| pick(i, &["coinbase", "txid", "vout", "sequence"])).collect();
+    let vout: Vec<Value> = list("vout")
+        .iter()
+        .map(|o| {
+            let mut out = pick(o, &["value", "n"]);
+            out["scriptPubKey"] = pick(&o["scriptPubKey"], &["hex", "type", "addresses", "address"]);
+            out
+        })
+        .collect();
+    let mut t = pick(raw, &["version", "type", "hex", "valueBalanceSat"]);
+    if raw.get("valueBalanceSat").is_some() {
+        t["shieldSpends"] = json!(list("vShieldSpend").len());
+        t["shieldOutputs"] = json!(list("vShieldOutput").len());
+    }
+    let size = raw["hex"].as_str().map_or(0, str::len) + 200 * (vin.len() + vout.len()) + 300;
+    t["vin"] = Value::Array(vin);
+    t["vout"] = Value::Array(vout);
+    (t, size)
+}
+
 impl AddrIndex {
-    /// Verbose tx JSON from the node (cached for confirmed txs).
-    fn raw_tx(&self, txid: &Txid, confirmed: bool) -> Result<Value, String> {
+    /// Trimmed verbose tx JSON from the node (cached for confirmed txs).
+    fn raw_tx(&self, txid: &Txid, confirmed: bool) -> Result<Arc<Value>, String> {
         if let Some(v) = self.tx_cache.lock().unwrap().get(txid) {
             return Ok(v);
         }
-        let v = self.rpc.get_raw_transaction(&txid_to_hex(txid), true)?;
+        let (v, size) = trim_tx(&self.rpc.get_raw_transaction(&txid_to_hex(txid), true)?);
+        let v = Arc::new(v);
         if confirmed {
-            self.tx_cache.lock().unwrap().put(*txid, v.clone());
+            self.tx_cache.lock().unwrap().put(*txid, v.clone(), size);
         }
         Ok(v)
     }
 
-    /// Verbose tx JSON of the `txids` not cached yet, fetched in JSON-RPC
-    /// batches (one round trip per 100 txs instead of one per tx).
-    fn prefetch_raw(&self, txids: &[Txid]) -> HashMap<Txid, Value> {
+    /// Trimmed verbose tx JSON of the `txids` not cached yet, fetched in
+    /// JSON-RPC batches (one round trip per 100 txs instead of one per tx).
+    fn prefetch_raw(&self, txids: &[Txid]) -> HashMap<Txid, (Arc<Value>, usize)> {
         let missing: Vec<Txid> = {
             let cache = self.tx_cache.lock().unwrap();
-            txids.iter().filter(|t| !cache.contains(t)).copied().collect()
+            let mut seen = HashSet::new();
+            txids.iter().filter(|t| !cache.contains(t) && seen.insert(**t)).copied().collect()
         };
         let mut out = HashMap::new();
         for chunk in missing.chunks(100) {
@@ -205,11 +235,54 @@ impl AddrIndex {
             let Ok(answers) = self.rpc.batch("getrawtransaction", &params) else { break };
             for (t, answer) in chunk.iter().zip(answers) {
                 if let Ok(v) = answer {
-                    out.insert(*t, v);
+                    let (v, size) = trim_tx(&v);
+                    out.insert(*t, (Arc::new(v), size));
                 }
             }
         }
         out
+    }
+
+    /// Value and addresses of output `n` of `prev`: from the index, the
+    /// mempool, or (an output a pruning index dropped) the node.
+    fn prevout(&self, prev: &Txid, n: u32) -> Option<(u64, Vec<String>)> {
+        if let Some(o) = self.store.output(prev, n).ok().flatten() {
+            return Some((o.value, o.addresses));
+        }
+        if let Some(o) = self.mempool.read().unwrap().txs.get(prev).and_then(|t| t.outputs.iter().find(|o| o.n == n)) {
+            return Some((o.value, o.addresses.clone()));
+        }
+        // Zerocoin spends have no transparent prevout.
+        if prev.iter().all(|&b| b == 0) {
+            return None;
+        }
+        let tx = self.raw_tx(prev, true).ok()?;
+        let out = tx["vout"].as_array()?.iter().find(|o| o["n"].as_u64() == Some(n as u64))?;
+        Some((value_to_sats(&out["value"]), super::store::vout_addresses(out)))
+    }
+
+    /// Caches the previous transactions of the inputs of `txs` that the
+    /// index doesn't describe (a pruning index), in batches, so a page of
+    /// history doesn't ask the node once per input.
+    fn prefetch_prevouts(&self, txs: &[Arc<Value>]) {
+        let mut wanted = Vec::new();
+        for tx in txs {
+            for input in tx["vin"].as_array().map(Vec::as_slice).unwrap_or_default() {
+                let Some(prev) = input["txid"].as_str().and_then(txid_from_hex) else { continue };
+                let n = input["vout"].as_u64().unwrap_or(0) as u32;
+                if prev.iter().any(|&b| b != 0) && self.store.output(&prev, n).ok().flatten().is_none() {
+                    wanted.push(prev);
+                }
+            }
+        }
+        if wanted.is_empty() {
+            return;
+        }
+        let fetched = self.prefetch_raw(&wanted);
+        let mut cache = self.tx_cache.lock().unwrap();
+        for (t, (v, size)) in fetched {
+            cache.put(t, v, size);
+        }
     }
 
     /// Blockbook-style transaction object.
@@ -217,14 +290,14 @@ impl AddrIndex {
         self.tx_json_with(txid, None)
     }
 
-    /// [`Self::tx_json`] with the verbose tx JSON already fetched.
-    fn tx_json_with(&self, txid: &Txid, fetched: Option<Value>) -> Result<Value, String> {
+    /// [`Self::tx_json`] with the trimmed tx JSON already fetched.
+    fn tx_json_with(&self, txid: &Txid, fetched: Option<(Arc<Value>, usize)>) -> Result<Value, String> {
         let location = self.store.tx_location(txid)?;
         let mempool_seen = self.mempool.read().unwrap().txs.get(txid).map(|t| t.first_seen);
         let raw = match fetched {
-            Some(v) => {
+            Some((v, size)) => {
                 if location.is_some() {
-                    self.tx_cache.lock().unwrap().put(*txid, v.clone());
+                    self.tx_cache.lock().unwrap().put(*txid, v.clone(), size);
                 }
                 v
             }
@@ -250,12 +323,7 @@ impl AddrIndex {
                 "n": i,
                 "isAddress": false,
             });
-            let resolved = txid_from_hex(prev).and_then(|p| {
-                self.store.output(&p, n).ok().flatten().map(|o| (o.value, o.addresses)).or_else(|| {
-                    let mp = self.mempool.read().unwrap();
-                    mp.txs.get(&p).and_then(|t| t.outputs.iter().find(|o| o.n == n)).map(|o| (o.value, o.addresses.clone()))
-                })
-            });
+            let resolved = txid_from_hex(prev).and_then(|p| self.prevout(&p, n));
             if let Some((value, addresses)) = resolved {
                 value_in += value;
                 entry["value"] = json!(value.to_string());
@@ -331,8 +399,8 @@ impl AddrIndex {
         }
         if raw.get("valueBalanceSat").is_some() {
             j["valueBalanceSat"] = json!(value_balance.to_string());
-            j["shieldSpends"] = json!(raw["vShieldSpend"].as_array().map(|a| a.len()).unwrap_or(0));
-            j["shieldOutputs"] = json!(raw["vShieldOutput"].as_array().map(|a| a.len()).unwrap_or(0));
+            j["shieldSpends"] = raw["shieldSpends"].clone();
+            j["shieldOutputs"] = raw["shieldOutputs"].clone();
         }
         Ok(j)
     }
@@ -359,31 +427,42 @@ struct DerivedAddr {
     used: bool,
 }
 
+/// Addresses derived and looked up at a time while walking an xpub.
+const DERIVE_RUN: usize = 50;
+
 impl AddrIndex {
-    fn derived(&self, xpub: &str, chain: u32, index: u32) -> Result<String, String> {
-        {
+    /// Addresses `from..to` of `chain` (`chain_key`, of `xpub`). Derived
+    /// outside the cache's lock, so other requests don't wait on it.
+    fn derived(&self, xpub: &str, chain_key: &ExtendedPubKey, chain: u32, from: usize, to: usize) -> Result<Vec<String>, String> {
+        let mut out: Vec<String> = {
             let cache = self.xpub_cache.lock().unwrap();
-            if let Some(chains) = cache.get(xpub) {
-                if let Some(a) = chains[chain as usize].get(index as usize) {
-                    return Ok(a.clone());
-                }
-            }
+            let list = cache.map.get(xpub).map(|chains| chains[chain as usize].as_slice()).unwrap_or_default();
+            list.get(from..to.min(list.len())).unwrap_or_default().to_vec()
+        };
+        if out.len() == to - from {
+            return Ok(out);
         }
-        let key = ExtendedPubKey::parse(xpub)?;
-        let chain_key = key.derive_child(chain)?;
+        let first_new = from + out.len();
+        for i in first_new..to {
+            out.push(chain_key.derive_child(i as u32)?.p2pkh_address(self.net.p2pkh_prefix));
+        }
         let mut cache = self.xpub_cache.lock().unwrap();
-        if cache.len() > 1_000 {
-            cache.clear();
+        if cache.addresses + (to - first_new) > XpubCache::MAX_ADDRESSES {
+            cache.map.clear();
+            cache.addresses = 0;
         }
-        let entry = cache.entry(xpub.to_string()).or_insert_with(|| [Vec::new(), Vec::new()]);
-        let list = &mut entry[chain as usize];
-        // Derive in chunks so gap scans don't re-parse the xpub per address.
-        let target = (index as usize + 1).max(list.len() + 50);
-        while list.len() < target {
-            let child = chain_key.derive_child(list.len() as u32)?;
-            list.push(child.p2pkh_address(self.net.p2pkh_prefix));
-        }
-        Ok(list[index as usize].clone())
+        let list = &mut cache.map.entry(xpub.to_string()).or_insert_with(|| [Vec::new(), Vec::new()])[chain as usize];
+        // Kept only while the list stays gapless (it may have been cleared
+        // or grown meanwhile).
+        let added = if (first_new..to).contains(&list.len()) {
+            let new = &out[list.len() - from..];
+            list.extend_from_slice(new);
+            new.len()
+        } else {
+            0
+        };
+        cache.addresses += added;
+        Ok(out)
     }
 
     /// Walk receive (0) and change (1) chains until `gap` consecutive
@@ -392,17 +471,24 @@ impl AddrIndex {
         let key = ExtendedPubKey::parse(xpub)?;
         let account = key.child_number & 0x7fff_ffff;
         let coin = self.net.bip44_coin_type;
-        let mp = self.mempool.read().unwrap();
         let mut out = Vec::new();
         for chain in 0..2u32 {
+            let chain_key = key.derive_child(chain)?;
             let mut unused_run = 0;
-            let mut i = 0u32;
+            let mut i = 0usize;
             while unused_run < gap {
-                let address = self.derived(xpub, chain, i)?;
-                let used = self.store.is_used(&address)? || mp.touches(&address);
-                unused_run = if used { 0 } else { unused_run + 1 };
-                out.push(DerivedAddr { address, path: format!("m/44'/{coin}'/{account}'/{chain}/{i}"), used });
-                i += 1;
+                let run = self.derived(xpub, &chain_key, chain, i, i + DERIVE_RUN)?;
+                let used = self.store.used(&run)?;
+                let mp = self.mempool.read().unwrap();
+                for (address, used) in run.into_iter().zip(used) {
+                    if unused_run >= gap {
+                        break;
+                    }
+                    let used = used || mp.touches(&address);
+                    unused_run = if used { 0 } else { unused_run + 1 };
+                    out.push(DerivedAddr { address, path: format!("m/44'/{coin}'/{account}'/{chain}/{i}"), used });
+                    i += 1;
+                }
             }
         }
         Ok(out)
@@ -522,6 +608,8 @@ fn history_json(idx: &AddrIndex, total: usize, slice: &[Txid], q: &ListQuery, de
     }
     if details == Details::Txs && !slice.is_empty() {
         let mut fetched = idx.prefetch_raw(slice);
+        let page: Vec<Arc<Value>> = fetched.values().map(|(v, _)| v.clone()).collect();
+        idx.prefetch_prevouts(&page);
         let mut list = Vec::with_capacity(slice.len());
         for t in slice {
             list.push(idx.tx_json_with(t, fetched.remove(t))?);
@@ -661,10 +749,12 @@ async fn utxo(
         };
         let tip = idx.indexed_tip().unwrap_or(0);
         let only_confirmed = q.confirmed.unwrap_or(false);
+        // From the index first: the mempool's lock is held only for the rest.
+        let confirmed = targets.iter().map(|(addr, _)| idx.store.utxos(addr)).collect::<Result<Vec<_>, _>>().map_err(internal)?;
         let mp = idx.mempool.read().unwrap();
         let mut seen: HashSet<(Txid, u32)> = HashSet::new();
         let mut out = Vec::new();
-        for (addr, path) in &targets {
+        for ((addr, path), confirmed) in targets.iter().zip(confirmed) {
             if !only_confirmed {
                 for t in mp.txids_for(addr) {
                     let Some(tx) = mp.txs.get(&t) else { continue };
@@ -685,7 +775,7 @@ async fn utxo(
                     }
                 }
             }
-            for u in idx.store.utxos(addr).map_err(internal)? {
+            for u in confirmed {
                 if mp.is_spent(&u.txid, u.vout) || !seen.insert((u.txid, u.vout)) {
                     continue;
                 }

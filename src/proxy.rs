@@ -5,12 +5,14 @@
 use std::sync::Arc;
 
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{header, StatusCode};
+use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Deserialize;
 use serde_json::Value;
 
 use crate::api::AppState;
+use crate::block_cache::{Entry, Want, MPW_BLOCK_FILTER};
 
 #[derive(Deserialize, Default)]
 pub struct ProxyQuery {
@@ -48,7 +50,9 @@ impl JqPolicy {
         match self.mode {
             JqMode::Off => Err("jq filters are disabled on this bridge".into()),
             JqMode::Any if expr.len() > 10_000 => Err("filter expression too long".into()),
-            JqMode::Any => Ok(expr.to_string()),
+            // Known filters in their canonical form, so the block cache
+            // still answers MyPIVXWallet's.
+            JqMode::Any => Ok(known_filter(expr).unwrap_or_else(|| expr.to_string())),
             JqMode::Known => known_filter(expr).ok_or_else(|| "filter not allowed on this bridge".into()),
         }
     }
@@ -59,7 +63,7 @@ pub async fn rpc_proxy(
     State(state): State<Arc<AppState>>,
     Path(method): Path<String>,
     Query(query): Query<ProxyQuery>,
-) -> Result<Json<Value>, (StatusCode, String)> {
+) -> Result<Response, (StatusCode, String)> {
     // Validate method against whitelist
     if !state.allowed_rpcs.iter().any(|r| r == &method) {
         return Err((StatusCode::FORBIDDEN, format!("RPC method '{method}' not allowed")));
@@ -79,13 +83,23 @@ pub async fn rpc_proxy(
             let cached = state.hash_cache.read().unwrap().get(height).map(|h| h.to_string());
             if let Some(hash) = cached {
                 log_timing(start, &method);
-                return Ok(Json(Value::String(hash)));
+                return Ok(Json(Value::String(hash)).into_response());
             }
         }
     }
 
+    // What a getblock request wants of the block cache: MyPIVXWallet's
+    // filter is answered from it too, without jq.
+    let want = (method == "getblock").then(|| {
+        let verbosity = block_verbosity(&params);
+        match filter.as_deref() {
+            Some(MPW_BLOCK_FILTER) if verbosity == 2 => Want::Mpw,
+            _ => Want::Verbosity(verbosity),
+        }
+    });
+
     // Fast path: serve getblock from block cache (then apply jq filter if needed)
-    if method == "getblock" {
+    if let Some(want) = want {
         // First param can be a hash (string) or height (number) — resolve to hash
         let block_hash = if let Some(hash) = params.first().and_then(|v| v.as_str()) {
             Some(hash.to_string())
@@ -97,13 +111,11 @@ pub async fn rpc_proxy(
         };
 
         if let Some(hash) = &block_hash {
-            let verbosity = block_verbosity(&params);
             let chain_h = state.chain_height.load(std::sync::atomic::Ordering::Relaxed);
-            let cached = state.block_cache.read().unwrap().get(hash, verbosity, chain_h);
+            let cached = state.block_cache.read().unwrap().get(hash, want, chain_h, |h| successor(&state, h));
             if let Some(json) = cached {
-                let filtered = run_filter(&state, json, filter.as_deref()).await?;
                 log_timing(start, &method);
-                return Ok(Json(filtered));
+                return filtered_bytes(&state, json, want, filter.as_deref()).await;
             }
         }
     }
@@ -124,7 +136,7 @@ pub async fn rpc_proxy(
         ) {
             state.hash_cache.write().unwrap().insert(height, hash.to_string());
         }
-    } else if method == "getblock" {
+    } else if let Some(want) = want {
         // Only blocks on the main chain (an orphan has confirmations -1).
         let on_chain = result.get("confirmations").and_then(|v| v.as_i64()).is_some_and(|c| c > 0);
         if let (true, Some(height), Some(hash)) = (
@@ -133,10 +145,18 @@ pub async fn rpc_proxy(
             result.get("hash").and_then(|v| v.as_str()),
         ) {
             state.hash_cache.write().unwrap().insert(height, hash.to_string());
-
-            // Also populate block cache
-            let verbosity = block_verbosity(&params);
-            state.block_cache.write().unwrap().insert(hash, verbosity, &result);
+            if let Some(entry) = Entry::new(&result) {
+                let chain_h = state.chain_height.load(std::sync::atomic::Ordering::Relaxed).max(height);
+                let mut cache = state.block_cache.write().unwrap();
+                cache.insert_entry(hash, block_verbosity(&params), entry);
+                if want == Want::Mpw {
+                    if let Some(json) = cache.get(hash, want, chain_h, |h| successor(&state, h)) {
+                        drop(cache);
+                        log_timing(start, &method);
+                        return Ok(json_response(json));
+                    }
+                }
+            }
         }
     }
 
@@ -155,7 +175,29 @@ pub async fn rpc_proxy(
     } else {
         log_timing(start, &method);
     }
-    Ok(Json(filtered))
+    Ok(Json(filtered).into_response())
+}
+
+/// The hash of block `height` if known without the node: for a cached
+/// block's `nextblockhash`.
+fn successor(state: &AppState, height: u32) -> Option<String> {
+    let cached = state.hash_cache.read().unwrap().get(height).map(str::to_string);
+    cached.or_else(|| state.store.hash_at(height).ok().flatten())
+}
+
+/// A JSON answer already serialized.
+fn json_response(json: Vec<u8>) -> Response {
+    ([(header::CONTENT_TYPE, "application/json")], json).into_response()
+}
+
+/// A cached block answer: as it is, or through a jq filter other than
+/// MyPIVXWallet's.
+async fn filtered_bytes(state: &Arc<AppState>, json: Vec<u8>, want: Want, filter: Option<&str>) -> Result<Response, (StatusCode, String)> {
+    if want == Want::Mpw || filter.is_none() {
+        return Ok(json_response(json));
+    }
+    let value = serde_json::from_slice(&json).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(run_filter(state, value, filter).await?).into_response())
 }
 
 /// `getblock`'s verbosity as pivxd reads it: a number (0 or less is hex,
@@ -197,7 +239,7 @@ async fn run_filter(state: &Arc<AppState>, value: Value, filter: Option<&str>) -
 fn known_filter(expr: &str) -> Option<String> {
     let s = strip_whitespace(expr)?;
     if s == ".|.txs=[.tx[]|{hex:.hex,txid:.txid}]|del(.tx)" {
-        return Some(". | .txs = [.tx[] | { hex: .hex, txid: .txid}] | del(.tx)".into());
+        return Some(MPW_BLOCK_FILTER.into());
     }
     if let Some(ids) = s.strip_prefix(".[]|select(").and_then(|r| r.strip_suffix(')')).and_then(mn_id_clauses) {
         return Some(format!(".[] | select({ids})"));
@@ -356,7 +398,7 @@ fn get_compiled_filter(expr: &str) -> Result<Arc<JaqFilter>, String> {
 /// Apply a jq filter expression to a JSON value using jaq (pure Rust).
 ///
 /// Filter compilation is cached — first call compiles, subsequent calls reuse.
-fn apply_jq(value: &Value, expr: &str) -> Result<Value, String> {
+pub(crate) fn apply_jq(value: &Value, expr: &str) -> Result<Value, String> {
     let compiled = get_compiled_filter(expr)?;
 
     // Parse input: serde_json::Value → string → jaq Val

@@ -27,10 +27,11 @@ Benchmarked head-to-head against PivxNodeController on the same production serve
 - **Streamed from disk** — `getshielddata` streams the requested byte range of `shield.bin` in 1 MB chunks. Nothing is copied into the process per request, so memory stays flat however many wallets sync at once; the OS page cache keeps the hot part in RAM
 - **No gzip on shield data** — the stream is random-looking (gzip saves under 2 %), so it goes out uncompressed with an exact `Content-Length`; JSON answers are still gzipped
 - **Indexed offsets** — a small redb database maps each shield block to its offset in all three stream formats, so start offsets and lengths are O(log n) lookups
-- **Parallel catch-up** — 8 RPC workers fetch blocks while one thread scans them in order and commits every 1000 blocks; a restart resumes where it stopped
-- **Inline tx extraction** — `getblock` verbosity 2 returns tx hex inline, eliminating a separate RPC call per transaction. 100x fewer RPC calls during chain scan
+- **Parallel catch-up** — 4 RPC workers per index fetch blocks and read them, while one thread stores them in order and commits every 1000 blocks; a restart resumes where it stopped
+- **Raw blocks** — the shield index reads blocks raw (`getblock` verbosity 0): a third of the bytes of their JSON, and about half the node's CPU. Each block's transactions are checked against its merkle root (a block that doesn't match is read as JSON instead). Only the last 1000 blocks are read as JSON, for the proxy's block cache
 - **ZMQ + polling** — new blocks indexed instantly via ZMQ hashblock notifications, with a 10s polling safety net that catches anything ZMQ misses
 - **Block hash LRU cache** — the last 1,000 height→hash mappings are cached in memory. `getblockhash` proxy calls serve from cache in <0.01ms instead of ~1ms RPC round-trips. On production traffic, ~50% of proxy calls are cache hits
+- **Block cache** — `getblock` answers for recent blocks are kept as JSON bytes (1000 answers, 64 MB at most). MyPIVXWallet's filtered `getblock` and PIVXie's verbosity 1 are answered from them without jq
 - **Opt-in compact formats** — strip Groth16 proofs and signatures that light wallets never verify, cutting sync data by 24-42%
 
 ## Quick Start
@@ -76,6 +77,8 @@ sudo systemctl enable --now pivx-bridge
 ### Behind nginx
 
 [`contrib/nginx-pivx-bridge.conf`](contrib/nginx-pivx-bridge.conf) puts HTTPS, HTTP/2 and gzip in front of a bridge listening on localhost only (`LISTEN=127.0.0.1`, `NO_COMPRESSION=true`). It takes long transaction URLs, streams shield data straight through and keeps `/watch` long-polls open. It also keeps addresses and xpubs out of the access log.
+
+Exposed directly, the bridge closes connections that send no request within 30 s (idle kept-alive ones too), and requests whose body stalls for 30 s.
 
 ## PIVX Node Configuration
 
@@ -185,6 +188,7 @@ src/
   stream.rs       Binary stream encoder + compact conversion (PivxCompat / Compact / CompactPlus)
   shield_store.rs shield.bin + redb index (offsets, cursor, recent hashes), crash-safe commits
   shield_sync.rs  Shield indexer thread: parallel catch-up, exact reorg rollback
+  fetch.rs        Block fetch workers for both indexers' catch-up
   api.rs          Shield endpoints, streamed from disk + block hash LRU cache
   proxy.rs        RPC proxy with jq filtering (jaq) + response timing
   addr_index/   Transparent address index (opt-in)
@@ -221,6 +225,7 @@ All options support both CLI flags and environment variables:
 | `--addr-index` | `ADDR_INDEX` | `false` | Enable the transparent address index |
 | `--sapling-params-dir` | `SAPLING_PARAMS_DIR` | `$HOME/.pivx-params` | Directory with `sapling-{output,spend}.params` to serve |
 | `--addr-index-path` | `ADDR_INDEX_PATH` | `addr_index.redb` | Address index database (mainnet) |
+| `--addr-index-prune` | `ADDR_INDEX_PRUNE` | `false` | Drop spent outputs once 1,000 blocks deep: a smaller index, but transaction details then ask the node for the transactions those inputs spent |
 | `--testnet-addr-index-path` | `TESTNET_ADDR_INDEX_PATH` | `addr_index.testnet.redb` | Address index database (testnet) |
 
 Default allowed RPCs: `getblockcount`, `getblockhash`, `getblock`, `getrawtransaction`, `sendrawtransaction`, `getmasternodecount`, `listmasternodes`, `relaymasternodebroadcast`, `getnetworkinfo`, `getbudgetprojection`, `getbudgetinfo`, `getbudgetvotes`, `mnbudgetrawvote`, `submitbudget`
@@ -246,7 +251,7 @@ The bridge writes these files in the working directory (testnet: `shield.testnet
 
 - **`shield.bin`** — the PIVX-compat shield stream (append-only), served by byte range
 - **`shield.redb`** — per shield block, its offset in each stream format; the scan cursor; hashes of the last 1000 scanned blocks (exact reorg detection, also across restarts)
-- **`addr_index.redb`** — the transparent address index (only with `ADDR_INDEX=true`). It records which chain it indexes, so it opens without the node; if the node turns out to be on another chain (RPC pointed at the wrong network), the bridge exits instead of indexing it
+- **`addr_index.redb`** — the transparent address index (only with `ADDR_INDEX=true`). It records which chain it indexes, so it opens without the node; if the node turns out to be on another chain (RPC pointed at the wrong network), the bridge exits instead of indexing it. With `ADDR_INDEX_PRUNE=true`, outputs spent more than 1,000 blocks ago are dropped as the index grows (on regtest that left a third of them); turning it on doesn't shrink an existing index, a rebuild does
 
 New blocks are appended to `shield.bin` and fsynced before one database transaction records them, so on startup `shield.bin` is simply cut back to the recorded length. Deleting `shield.redb` (or a database from an incompatible version) makes the bridge rebuild the shield data from scratch.
 

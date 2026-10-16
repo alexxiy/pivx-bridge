@@ -1,9 +1,10 @@
 //! Persistent transparent address index (redb).
 //!
 //! Every output ever created is kept in `OUTS` (so spent inputs can be
-//! described without extra RPCs), unspent outputs are mirrored per
-//! address in `ADDR_UTXO`, and every (address, tx) pair lands in
-//! `ADDR_TX` with the address's received/sent delta for that tx.
+//! described without extra RPCs), unless pruning drops the spent ones
+//! older than the undo window; unspent outputs are mirrored per address
+//! in `ADDR_UTXO`, and every (address, tx) pair lands in `ADDR_TX` with
+//! the address's received/sent delta for that tx.
 //!
 //! Addresses are keyed by `sha256(address_string)[..20]` so every
 //! address kind the node decodes (P2PKH, P2SH, P2PK, cold-stake
@@ -165,6 +166,71 @@ impl StoredOut {
     }
 }
 
+/// A block as the index stores it, read from a verbose (verbosity 2)
+/// `getblock` answer. Much smaller than the JSON, so blocks waiting for
+/// their turn during catch-up take little memory.
+pub struct IndexBlock {
+    pub height: u32,
+    pub hash: String,
+    pub prev_hash: Option<String>,
+    pub time: u32,
+    pub txs: Vec<IndexTx>,
+}
+
+pub struct IndexTx {
+    pub txid: Txid,
+    pub flags: u8,
+    /// Transparent prevouts spent (none for a coinbase).
+    pub inputs: Vec<(Txid, u32)>,
+    /// (n, value, addresses) of the outputs with addresses.
+    pub outputs: Vec<(u32, u64, Vec<String>)>,
+}
+
+impl IndexBlock {
+    pub fn from_json(block: &Value) -> StoreResult<Self> {
+        let height = block["height"].as_u64().ok_or("block without height")? as u32;
+        let hash = block["hash"].as_str().filter(|h| txid_from_hex(h).is_some()).ok_or("bad block hash")?.to_string();
+        let txs_json = block["tx"].as_array().ok_or("block without tx array (need verbosity 2)")?;
+        let mut txs = Vec::with_capacity(txs_json.len());
+        for tx in txs_json {
+            let txid = txid_from_hex(tx["txid"].as_str().unwrap_or("")).ok_or("bad txid")?;
+            let vin: &[Value] = tx["vin"].as_array().map(|a| a.as_slice()).unwrap_or_default();
+            let vout: &[Value] = tx["vout"].as_array().map(|a| a.as_slice()).unwrap_or_default();
+            let is_coinbase = vin.first().map(|v| v.get("coinbase").is_some_and(|c| !c.is_null())).unwrap_or(false);
+            let is_coinstake = !is_coinbase
+                && !vin.is_empty()
+                && vout.len() >= 2
+                && value_to_sats(&vout[0]["value"]) == 0
+                && vout[0]["scriptPubKey"]["hex"].as_str().unwrap_or("x").is_empty();
+            let flags = if is_coinbase { FLAG_COINBASE } else if is_coinstake { FLAG_COINSTAKE } else { 0 };
+            let inputs = if is_coinbase {
+                Vec::new()
+            } else {
+                vin.iter()
+                    .filter_map(|input| Some((input["txid"].as_str().and_then(txid_from_hex)?, input["vout"].as_u64()? as u32)))
+                    .collect()
+            };
+            let outputs = vout
+                .iter()
+                .enumerate()
+                .filter_map(|(i, out)| {
+                    let addresses = vout_addresses(out);
+                    let n = out["n"].as_u64().unwrap_or(i as u64) as u32;
+                    (!addresses.is_empty()).then(|| (n, value_to_sats(&out["value"]), addresses))
+                })
+                .collect();
+            txs.push(IndexTx { txid, flags, inputs, outputs });
+        }
+        Ok(Self {
+            height,
+            hash,
+            prev_hash: block["previousblockhash"].as_str().map(str::to_string),
+            time: block["time"].as_u64().unwrap_or(0) as u32,
+            txs,
+        })
+    }
+}
+
 /// Aggregated per-address stats (confirmed only).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct AddrStats {
@@ -260,6 +326,8 @@ impl UndoRecord {
 
 pub struct Store {
     db: Database,
+    /// Drop spent outputs once their block is past the undo window.
+    prune: bool,
 }
 
 pub type StoreResult<T> = Result<T, String>;
@@ -269,10 +337,10 @@ fn e<E: std::fmt::Display>(err: E) -> String {
 }
 
 impl Store {
-    pub fn open(path: &str) -> StoreResult<Self> {
+    pub fn open(path: &str, prune: bool) -> StoreResult<Self> {
         let db = Database::create(path)
             .map_err(|err| format!("{path}: {err} — delete it to rebuild the index"))?;
-        let store = Self { db };
+        let store = Self { db, prune };
         // Create all tables up front so read transactions never fail
         // with TableDoesNotExist on a fresh database.
         let w = crate::db::begin_write(&store.db)?;
@@ -345,14 +413,12 @@ impl Store {
         crate::db::begin_write(&self.db)
     }
 
-    /// Apply one verbose (verbosity 2) block inside an open write
-    /// transaction. `keep_undo` controls whether rollback data is
-    /// stored (only needed near the tip).
-    pub fn apply_block(&self, w: &WriteTransaction, block: &Value, keep_undo: bool) -> StoreResult<()> {
-        let height = block["height"].as_u64().ok_or("block without height")? as u32;
-        let hash = txid_from_hex(block["hash"].as_str().unwrap_or("")).ok_or("bad block hash")?;
-        let time = block["time"].as_u64().unwrap_or(0) as u32;
-        let txs = block["tx"].as_array().ok_or("block without tx array (need verbosity 2)")?;
+    /// Apply one block inside an open write transaction. `keep_undo`
+    /// controls whether rollback data is stored (only needed near the
+    /// tip); without it, a pruning index drops the outputs spent here.
+    pub fn apply_block(&self, w: &WriteTransaction, block: &IndexBlock, keep_undo: bool) -> StoreResult<()> {
+        let height = block.height;
+        let hash = txid_from_hex(&block.hash).ok_or("bad block hash")?;
 
         let mut outs = w.open_table(OUTS).map_err(e)?;
         let mut addr_tx = w.open_table(ADDR_TX).map_err(e)?;
@@ -364,57 +430,44 @@ impl Store {
         // Stats deltas for the whole block, flushed once at the end.
         let mut stat_delta: HashMap<AddrHash, AddrStats> = HashMap::new();
 
-        for (txpos, tx) in txs.iter().enumerate() {
+        for (txpos, tx) in block.txs.iter().enumerate() {
             let txpos = txpos as u32;
-            let txid = txid_from_hex(tx["txid"].as_str().unwrap_or("")).ok_or("bad txid")?;
-            let vin: &[Value] = tx["vin"].as_array().map(|a| a.as_slice()).unwrap_or_default();
-            let vout: &[Value] = tx["vout"].as_array().map(|a| a.as_slice()).unwrap_or_default();
-            let is_coinbase = vin.first().map(|v| v.get("coinbase").is_some_and(|c| !c.is_null())).unwrap_or(false);
-            let is_coinstake = !is_coinbase
-                && !vin.is_empty()
-                && vout.len() >= 2
-                && value_to_sats(&vout[0]["value"]) == 0
-                && vout[0]["scriptPubKey"]["hex"].as_str().unwrap_or("x").is_empty();
-            let flags = if is_coinbase { FLAG_COINBASE } else if is_coinstake { FLAG_COINSTAKE } else { 0 };
+            let txid = tx.txid;
+            let flags = tx.flags;
 
             // Per-tx address deltas.
             let mut deltas: HashMap<AddrHash, (u64, u64)> = HashMap::new();
 
-            if !is_coinbase {
-                for input in vin {
-                    let Some(prev) = input["txid"].as_str().and_then(txid_from_hex) else { continue };
-                    let Some(n) = input["vout"].as_u64() else { continue };
-                    let op = outpoint_key(&prev, n as u32);
-                    let stored = outs.get(&op[..]).map_err(e)?.and_then(|v| StoredOut::decode(v.value()));
-                    let Some(stored) = stored else {
-                        // Prevout not indexed: only legitimate for
-                        // zerocoin-era spends (no transparent prevout).
-                        continue;
-                    };
-                    for a in &stored.addresses {
-                        let ah = addr_hash(a);
-                        deltas.entry(ah).or_default().1 += stored.value;
-                        addr_utxo.remove(&addr_utxo_key(&ah, &prev, n as u32)[..]).map_err(e)?;
-                    }
-                    undo.spent.push(op);
+            for &(prev, n) in &tx.inputs {
+                let op = outpoint_key(&prev, n);
+                let stored = if self.prune && !keep_undo {
+                    outs.remove(&op[..]).map_err(e)?.and_then(|v| StoredOut::decode(v.value()))
+                } else {
+                    outs.get(&op[..]).map_err(e)?.and_then(|v| StoredOut::decode(v.value()))
+                };
+                let Some(stored) = stored else {
+                    // Prevout not indexed: only legitimate for
+                    // zerocoin-era spends (no transparent prevout).
+                    continue;
+                };
+                for a in &stored.addresses {
+                    let ah = addr_hash(a);
+                    deltas.entry(ah).or_default().1 += stored.value;
+                    addr_utxo.remove(&addr_utxo_key(&ah, &prev, n)[..]).map_err(e)?;
                 }
+                undo.spent.push(op);
             }
 
-            for (i, out) in vout.iter().enumerate() {
-                let n = out["n"].as_u64().unwrap_or(i as u64) as u32;
-                let addresses = vout_addresses(out);
-                if addresses.is_empty() {
-                    continue;
-                }
-                let value = value_to_sats(&out["value"]);
-                let stored = StoredOut { value, height, flags, addresses };
+            for (n, value, addresses) in &tx.outputs {
+                let (n, value) = (*n, *value);
+                let stored = StoredOut { value, height, flags, addresses: addresses.clone() };
                 let op = outpoint_key(&txid, n);
                 outs.insert(&op[..], &stored.encode()[..]).map_err(e)?;
                 let mut uv = [0u8; 13];
                 uv[..8].copy_from_slice(&value.to_le_bytes());
                 uv[8..12].copy_from_slice(&height.to_le_bytes());
                 uv[12] = flags;
-                for a in &stored.addresses {
+                for a in addresses {
                     let ah = addr_hash(a);
                     deltas.entry(ah).or_default().0 += value;
                     addr_utxo.insert(&addr_utxo_key(&ah, &txid, n)[..], &uv[..]).map_err(e)?;
@@ -451,7 +504,7 @@ impl Store {
         let mut blocks = w.open_table(BLOCKS).map_err(e)?;
         let mut bv = [0u8; 36];
         bv[..32].copy_from_slice(&hash);
-        bv[32..].copy_from_slice(&time.to_le_bytes());
+        bv[32..].copy_from_slice(&block.time.to_le_bytes());
         blocks.insert(height, &bv[..]).map_err(e)?;
 
         if keep_undo {
@@ -558,15 +611,22 @@ impl Store {
         Ok(tip)
     }
 
-    /// Drop undo records below `min_height`.
+    /// Drop undo records below `min_height`. A pruning index also drops
+    /// the outputs those blocks spent: they can't come back now.
     pub fn prune_undo(&self, w: &WriteTransaction, min_height: u32) -> StoreResult<()> {
         let mut u = w.open_table(UNDO).map_err(e)?;
-        let old: Vec<u32> = u
+        let mut outs = w.open_table(OUTS).map_err(e)?;
+        let old: Vec<(u32, Vec<u8>)> = u
             .range(..min_height)
             .map_err(e)?
-            .filter_map(|r| r.ok().map(|(k, _)| k.value()))
+            .filter_map(|r| r.ok().map(|(k, v)| (k.value(), v.value().to_vec())))
             .collect();
-        for h in old {
+        for (h, record) in old {
+            if self.prune {
+                for op in UndoRecord::decode(&record).map(|r| r.spent).unwrap_or_default() {
+                    outs.remove(&op[..]).map_err(e)?;
+                }
+            }
             u.remove(h).map_err(e)?;
         }
         Ok(())
@@ -582,8 +642,14 @@ impl Store {
         Ok(t.get(&addr_hash(addr)[..]).map_err(e)?.map(|v| AddrStats::decode(v.value())).unwrap_or_default())
     }
 
-    pub fn is_used(&self, addr: &str) -> StoreResult<bool> {
-        Ok(self.stats(addr)?.txs > 0)
+    /// Whether each of `addrs` has confirmed history, in one read.
+    pub fn used(&self, addrs: &[String]) -> StoreResult<Vec<bool>> {
+        let r = self.db.begin_read().map_err(e)?;
+        let t = r.open_table(ADDR_STATS).map_err(e)?;
+        addrs
+            .iter()
+            .map(|a| Ok(t.get(&addr_hash(a)[..]).map_err(e)?.is_some_and(|v| AddrStats::decode(v.value()).txs > 0)))
+            .collect()
     }
 
     /// Confirmed history of `addr` within `[from, to]` heights, ascending.
@@ -709,11 +775,11 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("addr_index.redb").to_string_lossy().into_owned();
 
-        let store = Store::open(&path).unwrap();
+        let store = Store::open(&path, false).unwrap();
         assert_eq!(store.chain().unwrap(), None);
         store.set_chain("regtest").unwrap();
         drop(store);
-        let store = Store::open(&path).unwrap();
+        let store = Store::open(&path, false).unwrap();
         assert_eq!(store.chain().unwrap().as_deref(), Some("regtest"));
         drop(store);
         let _ = std::fs::remove_dir_all(&dir);

@@ -110,6 +110,10 @@ pub struct ShieldStore {
     /// Bumped before shield.bin is cut back (reorg). A reader that sees it
     /// change while streaming stops, as the bytes may no longer match.
     generation: AtomicU64,
+    /// Bumped whenever the shield blocks change (added or rolled back).
+    changes: AtomicU64,
+    /// `/getshieldblocks`'s answer as of `changes`.
+    heights_json: Mutex<Option<(u64, axum::body::Bytes)>>,
 }
 
 fn e<E: std::fmt::Display>(err: E) -> String {
@@ -161,6 +165,8 @@ impl ShieldStore {
             lengths: RwLock::new(lengths),
             cursor: RwLock::new(cursor),
             generation: AtomicU64::new(0),
+            changes: AtomicU64::new(0),
+            heights_json: Mutex::new(None),
         };
         store.check_file_length()?;
         Ok(store)
@@ -289,6 +295,23 @@ impl ShieldStore {
         Ok(out)
     }
 
+    /// [`Self::heights`] as a JSON array, read again only after the
+    /// blocks change: wallets ask for it on every sync.
+    pub fn heights_json(&self) -> Result<axum::body::Bytes, String> {
+        let version = self.changes.load(Ordering::SeqCst);
+        if let Some((v, json)) = &*self.heights_json.lock().unwrap() {
+            if *v == version {
+                return Ok(json.clone());
+            }
+        }
+        let json = axum::body::Bytes::from(serde_json::to_vec(&self.heights()?).map_err(e)?);
+        // Kept unless the blocks changed while they were read.
+        if self.changes.load(Ordering::SeqCst) == version {
+            *self.heights_json.lock().unwrap() = Some((version, json.clone()));
+        }
+        Ok(json)
+    }
+
     pub fn block_count(&self) -> Result<u64, String> {
         let r = self.db.begin_read().map_err(e)?;
         let t = r.open_table(BLOCKS).map_err(e)?;
@@ -344,6 +367,9 @@ impl ShieldStore {
             meta.insert("cursor", &cursor.encode()[..]).map_err(e)?;
         }
         w.commit().map_err(e)?;
+        if !rows.is_empty() {
+            self.changes.fetch_add(1, Ordering::SeqCst);
+        }
         *self.lengths.write().unwrap() = lengths;
         *self.cursor.write().unwrap() = cursor;
         Ok(())
@@ -373,6 +399,7 @@ impl ShieldStore {
         }
         w.commit().map_err(e)?;
         self.generation.fetch_add(1, Ordering::SeqCst);
+        self.changes.fetch_add(1, Ordering::SeqCst);
         *self.lengths.write().unwrap() = lengths;
         *self.cursor.write().unwrap() = cursor;
         file.set_len(lengths.pivx).map_err(e)?;
