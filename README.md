@@ -73,6 +73,10 @@ sudo systemctl enable --now pivx-bridge
 
 `/opt/pivx-bridge` holds the binary, `.env` and the data files (see [Persistence](#persistence)). Home directories are read-only to the service, so put the Sapling parameters somewhere the `pivx-bridge` user can read and set `SAPLING_PARAMS_DIR`.
 
+### Behind nginx
+
+[`contrib/nginx-pivx-bridge.conf`](contrib/nginx-pivx-bridge.conf) puts HTTPS, HTTP/2 and gzip in front of a bridge listening on localhost only (`LISTEN=127.0.0.1`, `NO_COMPRESSION=true`). It takes long transaction URLs, streams shield data straight through and keeps `/watch` long-polls open. It also keeps addresses and xpubs out of the access log.
+
 ## PIVX Node Configuration
 
 Add to `pivx.conf`:
@@ -197,6 +201,7 @@ All options support both CLI flags and environment variables:
 | `--testnet-rpc-url` | `TESTNET_RPC_URL` | — | Testnet node RPC (enables `/testnet/`); `TESTNET_RPC_USER` / `TESTNET_RPC_PASS` default to the mainnet ones |
 | `--testnet-zmq-url` | `TESTNET_ZMQ_URL` | — | Testnet ZMQ endpoint (without it testnet checks for blocks every 10 s) |
 | `--port` | `PORT` | `3000` | HTTP server port |
+| `--listen` | `LISTEN` | `0.0.0.0` | Comma-separated IP addresses to listen on, IPv4 and/or IPv6 (`127.0.0.1` behind nginx, `0.0.0.0,::` for all) |
 | `--sapling-height` | `SAPLING_HEIGHT` | `2700501` | Sapling activation block (regtest: 301) |
 | `--testnet-sapling-height` | `TESTNET_SAPLING_HEIGHT` | `501` | Sapling activation block on testnet |
 | `--jq-filters` | `JQ_FILTERS` | `known` | Which proxy `filter`s run: `known`, `any` or `off` |

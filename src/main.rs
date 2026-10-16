@@ -14,6 +14,7 @@ mod shield_store;
 mod shield_sync;
 mod stream;
 
+use std::future::IntoFuture;
 use std::sync::atomic::AtomicU32;
 use std::sync::{mpsc, Arc, RwLock};
 
@@ -222,12 +223,29 @@ async fn main() {
         app.layer(CompressionLayer::new().compress_when(predicate)).into_make_service()
     };
 
-    let addr = format!("0.0.0.0:{}", config.port);
-    eprintln!("\n  Listening on http://{addr}");
+    let mut servers = Vec::new();
+    for ip in &config.listen {
+        let addr = std::net::SocketAddr::new(*ip, config.port);
+        let listener = bind(addr).unwrap_or_else(|e| panic!("failed to listen on {addr}: {e}"));
+        eprintln!("  Listening on http://{addr}");
+        servers.push(tokio::spawn(axum::serve(listener, app.clone()).into_future()));
+    }
+    for server in servers {
+        server.await.expect("server task failed").expect("server error");
+    }
+}
 
-    let listener = tokio::net::TcpListener::bind(&addr)
-        .await
-        .expect("failed to bind");
-
-    axum::serve(listener, app).await.expect("server error");
+/// A listening socket on [addr]. IPv6 ones take IPv6 only, so `0.0.0.0`
+/// and `::` can both be listened on.
+fn bind(addr: std::net::SocketAddr) -> std::io::Result<tokio::net::TcpListener> {
+    use socket2::{Domain, Socket, Type};
+    let socket = Socket::new(Domain::for_address(addr), Type::STREAM, None)?;
+    if addr.is_ipv6() {
+        socket.set_only_v6(true)?;
+    }
+    socket.set_reuse_address(true)?;
+    socket.set_nonblocking(true)?;
+    socket.bind(&addr.into())?;
+    socket.listen(1024)?;
+    tokio::net::TcpListener::from_std(socket.into())
 }

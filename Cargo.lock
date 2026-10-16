@@ -1352,7 +1352,7 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
 name = "pivx-bridge"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "axum",
  "bitcoincore-zmq",
@@ -1370,6 +1370,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.1",
+ "socket2",
  "tokio",
  "tower-http",
  "ureq",

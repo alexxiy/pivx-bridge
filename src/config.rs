@@ -40,6 +40,11 @@ pub struct Config {
     #[arg(long, env = "PORT", default_value_t = 3000)]
     pub port: u16,
 
+    /// Comma-separated IP addresses to listen on, IPv4 and/or IPv6 (e.g.
+    /// `127.0.0.1` behind nginx, or `0.0.0.0,::` for every address)
+    #[arg(long, env = "LISTEN", value_delimiter = ',', value_parser = parse_ip, default_value = "0.0.0.0")]
+    pub listen: Vec<std::net::IpAddr>,
+
     /// Comma-separated list of allowed RPC methods for the proxy
     #[arg(long, env = "ALLOWED_RPCS", default_value = "getblockcount,getblockhash,getblock,getrawtransaction,sendrawtransaction,getmasternodecount,listmasternodes,relaymasternodebroadcast,getnetworkinfo,getbudgetprojection,getbudgetinfo,getbudgetvotes,mnbudgetrawvote,submitbudget")]
     pub allowed_rpcs: String,
@@ -79,6 +84,13 @@ pub struct Config {
     /// another compressing proxy). Shield data is never compressed.
     #[arg(long, env = "NO_COMPRESSION")]
     pub no_compression: bool,
+}
+
+/// An IP address, IPv6 with or without brackets (`::1`, `[::1]`).
+fn parse_ip(s: &str) -> Result<std::net::IpAddr, String> {
+    let s = s.trim();
+    let bare = s.strip_prefix('[').and_then(|r| r.strip_suffix(']')).unwrap_or(s);
+    bare.parse().map_err(|_| format!("not an IP address: {s}"))
 }
 
 impl Config {
