@@ -73,9 +73,14 @@ pub struct CompactOutput {
 // Block scanning
 // ---------------------------------------------------------------------------
 
-/// Hex prefix of a Sapling-capable tx (see `SAPLING_HEADER`): other txs
-/// are skipped without decoding them.
-const SAPLING_HEADER_HEX: &str = "03000000";
+/// Hex prefix of a Sapling-capable tx, nVersion=3 (i16 LE) of any nType:
+/// other txs are skipped without decoding them. Special transactions
+/// (masternode registrations and the like, nType != 0) can carry shield
+/// spends and outputs too; their extra payload comes after the Sapling
+/// data, which is all the scanner and the wallets read. Leaving one out
+/// would cost every wallet a note commitment, and their tree would no
+/// longer match the chain.
+const SAPLING_VERSION_HEX: &str = "0300";
 
 /// Shield transactions of a `getblock <hash> 2` answer, or `None` when the
 /// block has none.
@@ -96,7 +101,7 @@ pub fn scan_block_json(block_json: &serde_json::Value) -> Result<Option<ShieldBl
             .get("hex")
             .and_then(|h| h.as_str())
             .ok_or_else(|| ScanError::Parse(format!("block {height}: tx without hex (needs verbosity 2)")))?;
-        if !raw_hex.starts_with(SAPLING_HEADER_HEX) {
+        if !raw_hex.starts_with(SAPLING_VERSION_HEX) {
             continue;
         }
         let tx_bytes = hex::hex_decode(raw_hex)
@@ -307,7 +312,51 @@ mod tests {
     fn sapling_header_correct() {
         // PIVX: nVersion=3 (i16 LE) + nType=0 (i16 LE)
         assert_eq!(SAPLING_HEADER, [0x03, 0x00, 0x00, 0x00]);
-        assert_eq!(hex::hex_decode(SAPLING_HEADER_HEX).unwrap(), SAPLING_HEADER);
+        assert_eq!(hex::hex_decode(SAPLING_VERSION_HEX).unwrap(), SAPLING_HEADER[..2]);
+    }
+
+    /// A v3 tx of type `n_type` with one shield output, then `payload`.
+    fn shield_tx(n_type: u16, payload: &[u8]) -> Vec<u8> {
+        let mut tx = vec![0x03, 0x00];
+        tx.extend(n_type.to_le_bytes());
+        tx.push(0); // vin
+        tx.push(0); // vout
+        tx.extend([0u8; 4]); // nLockTime
+        tx.push(0x01); // sapData present
+        tx.extend(0i64.to_le_bytes()); // valueBalance
+        tx.push(0); // spends
+        tx.push(1); // outputs
+        let mut out = vec![0u8; OUTPUT_DESC_SIZE];
+        out[32] = 0x22; // cmu
+        tx.extend(out);
+        tx.extend([0u8; 64]); // bindingSig
+        tx.extend_from_slice(payload);
+        tx
+    }
+
+    #[test]
+    fn special_transactions_with_shield_data_are_kept() {
+        let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        // ProRegTx (nType 1) with an extra payload, a normal shield tx,
+        // a special tx without shield data and a v1 tx.
+        let proreg = shield_tx(1, &[0x01, 0x03, 0xAA, 0xBB, 0xCC]);
+        let normal = shield_tx(0, &[]);
+        let mut no_shield = vec![0x03, 0x00, 0x01, 0x00, 0, 0, 0, 0, 0, 0, 0x00];
+        no_shield.extend([0x01, 0x01, 0xAA]);
+        let block = serde_json::json!({
+            "height": 900, "time": 1,
+            "tx": [
+                { "txid": "a", "hex": hex(&proreg) },
+                { "txid": "b", "hex": hex(&normal) },
+                { "txid": "c", "hex": hex(&no_shield) },
+                { "txid": "d", "hex": "01000000" },
+            ],
+        });
+        let b = scan_block_json(&block).unwrap().unwrap();
+        assert_eq!(b.txs.len(), 2);
+        assert_eq!(b.txs[0].raw, proreg, "kept whole, payload included");
+        assert_eq!(b.txs[0].compact.as_ref().unwrap().outputs[0].cmu[0], 0x22);
+        assert_eq!(b.txs[1].raw, normal);
     }
 
     #[test]
@@ -366,7 +415,7 @@ mod tests {
     #[test]
     fn parse_real_mainnet_tx() {
         // Real PIVX mainnet tx from block 5361234
-        // txid: 1c49a5a4c2db52cd6a0695ed0df3d0807c4b70044294fab3e6b0d7b6e01eeb72
+        // txid: 815921e01f022c640276427a37e8cf0bddd23eb77878fa03835ef97764d53394
         // 2 spends, 1 output, valueBalance = 13000000 sat
         let hex = include_str!("../tests/mainnet_sapling_tx.hex");
         let tx_bytes = hex::hex_decode(hex.trim()).expect("valid hex");
