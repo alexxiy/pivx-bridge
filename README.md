@@ -76,7 +76,7 @@ sudo systemctl enable --now pivx-bridge
 
 ### Behind nginx
 
-[`contrib/nginx-pivx-bridge.conf`](contrib/nginx-pivx-bridge.conf) puts HTTPS, HTTP/2 and gzip in front of a bridge listening on localhost only (`LISTEN=127.0.0.1`, `NO_COMPRESSION=true`). It takes long transaction URLs, streams shield data straight through and keeps `/watch` long-polls open. It also keeps addresses and xpubs out of the access log.
+[`contrib/nginx-pivx-bridge.conf`](contrib/nginx-pivx-bridge.conf) puts HTTPS, HTTP/2 and gzip (brotli too, if your nginx has the module) in front of a bridge listening on localhost only (`LISTEN=127.0.0.1`, `NO_COMPRESSION=true`). It takes long transaction URLs, streams shield data straight through and keeps `/watch` long-polls open. It also keeps addresses and xpubs out of the access log.
 
 Exposed directly, the bridge closes connections that send no request within 30 s (idle kept-alive ones too), and requests whose body stalls for 30 s. Behind nginx the same 30 s applies to nginx's own connections, which nginx keeps idle for 60 s unless told otherwise. The sample config sets `keepalive_timeout 25s` in its `upstream` block for this; keep that line in your own config.
 
