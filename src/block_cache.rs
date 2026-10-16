@@ -42,11 +42,13 @@ impl BlockCache {
 
     /// Look up a cached block, rehydrating `confirmations` and `nextblockhash`.
     ///
-    /// Falls back to other verbosity levels on miss — a verbosity 2 response
-    /// is a superset of verbosity 1, so serving it for a v1 request is safe.
+    /// A v1 request is also served from a cached v2 block: v2 is v1 with
+    /// each txid in `tx` expanded to the transaction, so mapping them back
+    /// to their txids gives the v1 answer.
     /// Read-only on the map — only atomics are mutated (hit/miss counters).
     pub fn get(&self, hash: &str, verbosity: u8, chain_height: u32) -> Option<Value> {
         let key = (hash.to_string(), verbosity);
+        let mut from_v2 = false;
         let entry = match self.entries.get(&key) {
             Some(e) => e,
             None => {
@@ -65,7 +67,10 @@ impl BlockCache {
                     return None;
                 }
                 match self.entries.get(&(hash.to_string(), 2u8)) {
-                    Some(e) => e,
+                    Some(e) => {
+                        from_v2 = true;
+                        e
+                    }
                     None => {
                         self.misses.fetch_add(1, Ordering::Relaxed);
                         return None;
@@ -76,7 +81,21 @@ impl BlockCache {
 
         self.hits.fetch_add(1, Ordering::Relaxed);
 
-        let mut json = entry.json.clone();
+        let mut json = if from_v2 {
+            // Copy all but `tx`, then the txids alone.
+            let mut obj = serde_json::Map::new();
+            for (k, v) in entry.json.as_object().into_iter().flatten() {
+                if k == "tx" {
+                    let txids = v.as_array().into_iter().flatten().map(|t| t.get("txid").cloned().unwrap_or(Value::Null));
+                    obj.insert(k.clone(), Value::Array(txids.collect()));
+                } else {
+                    obj.insert(k.clone(), v.clone());
+                }
+            }
+            Value::Object(obj)
+        } else {
+            entry.json.clone()
+        };
         if let Some(obj) = json.as_object_mut() {
             // confirmations = chain_height - block_height + 1
             let confs = chain_height.saturating_sub(entry.height) + 1;
@@ -258,16 +277,19 @@ mod tests {
     #[test]
     fn verbosity_fallback() {
         let mut cache = BlockCache::new(10);
-        let block = make_block(100, "abc");
+        let v2 = json!({ "hash": "abc", "height": 100, "tx": [{ "txid": "t1", "hex": "00" }, { "txid": "t2", "hex": "01" }] });
 
         // Insert at v2 only
-        cache.insert("abc", 2, &block);
+        cache.insert("abc", 2, &v2);
         assert_eq!(cache.entries.len(), 1);
 
-        // v2 lookup: direct hit
-        assert!(cache.get("abc", 2, 200).is_some());
-        // v1 lookup: falls back to v2 (superset)
-        assert!(cache.get("abc", 1, 200).is_some());
+        // v2 lookup: direct hit, full transactions
+        assert_eq!(cache.get("abc", 2, 200).unwrap()["tx"][0]["hex"], "00");
+        // v1 lookup: answered from v2, with txids in `tx` like pivxd's v1
+        let v1 = cache.get("abc", 1, 200).unwrap();
+        assert_eq!(v1["tx"], json!(["t1", "t2"]));
+        assert_eq!(v1["hash"], "abc");
+        assert_eq!(v1["confirmations"], 101);
         // v0 lookup: no fallback (v0 is hex, not JSON)
         assert!(cache.get("abc", 0, 200).is_none());
     }

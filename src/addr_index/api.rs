@@ -408,21 +408,26 @@ impl AddrIndex {
         Ok(out)
     }
 
-    /// Ordered (newest first) unique txids touching `addrs`, mempool first.
-    fn collect_txids(&self, addrs: &[&str], from: u32, to: Option<u32>) -> Result<Vec<Txid>, String> {
+    /// Unique mempool txids touching `addrs`, newest first.
+    fn mempool_txids(&self, addrs: &[&str]) -> Vec<Txid> {
         let mut seen: HashSet<Txid> = HashSet::new();
         let mut mempool: Vec<(u64, Txid)> = Vec::new();
-        if to.is_none() {
-            let mp = self.mempool.read().unwrap();
-            for a in addrs {
-                for t in mp.txids_for(a) {
-                    if seen.insert(t) {
-                        mempool.push((mp.txs.get(&t).map(|x| x.first_seen).unwrap_or(0), t));
-                    }
+        let mp = self.mempool.read().unwrap();
+        for a in addrs {
+            for t in mp.txids_for(a) {
+                if seen.insert(t) {
+                    mempool.push((mp.txs.get(&t).map(|x| x.first_seen).unwrap_or(0), t));
                 }
             }
         }
         mempool.sort_by_key(|m| std::cmp::Reverse(m.0));
+        mempool.into_iter().map(|(_, t)| t).collect()
+    }
+
+    /// Ordered (newest first) unique txids touching `addrs`, mempool first.
+    fn collect_txids(&self, addrs: &[&str], from: u32, to: Option<u32>) -> Result<Vec<Txid>, String> {
+        let mempool = if to.is_none() { self.mempool_txids(addrs) } else { Vec::new() };
+        let mut seen: HashSet<Txid> = mempool.iter().copied().collect();
         let mut confirmed: Vec<(u32, u32, Txid)> = Vec::new();
         for a in addrs {
             for h in self.store.history(a, from, to.unwrap_or(u32::MAX))? {
@@ -432,7 +437,44 @@ impl AddrIndex {
             }
         }
         confirmed.sort_by_key(|c| std::cmp::Reverse((c.0, c.1)));
-        Ok(mempool.into_iter().map(|(_, t)| t).chain(confirmed.into_iter().map(|(_, _, t)| t)).collect())
+        Ok(mempool.into_iter().chain(confirmed.into_iter().map(|(_, _, t)| t)).collect())
+    }
+
+    /// [`Self::collect_txids`] for an xpub, reused while the index tip and
+    /// the mempool stay the same: a wallet asks for page after page, and
+    /// an xpub's history has to be read whole to drop the txs its
+    /// addresses share.
+    fn xpub_txids(&self, xpub: &str, addrs: &[&str], from: u32, to: Option<u32>) -> Result<Arc<Vec<Txid>>, String> {
+        let key = (xpub.to_string(), from, to);
+        let version = (self.indexed_tip(), self.mempool.read().unwrap().seq());
+        if let Some(txids) = self.history_cache.lock().unwrap().get(&key, version) {
+            return Ok(txids);
+        }
+        let txids = Arc::new(self.collect_txids(addrs, from, to)?);
+        self.history_cache.lock().unwrap().put(key, version, txids.clone());
+        Ok(txids)
+    }
+
+    /// Unique txids touching `addr`, newest first, mempool first: the
+    /// count and the page `start..end`. Reads only the page from the index.
+    fn address_txids(&self, addr: &str, from: u32, to: Option<u32>, q: &ListQuery) -> Result<(usize, Vec<Txid>), String> {
+        let mempool = if to.is_none() { self.mempool_txids(&[addr]) } else { Vec::new() };
+        let confirmed = match (from, to) {
+            (0, None) => self.store.stats(addr)?.txs as usize,
+            _ => self.store.history_count(addr, from, to.unwrap_or(u32::MAX))?,
+        };
+        let total = mempool.len() + confirmed;
+        let (_, _, start, end) = paginate(total, q);
+        let m = mempool.len();
+        let mut page: Vec<Txid> = mempool[start.min(m)..end.min(m)].to_vec();
+        if end > m {
+            // A tx just mined may still be in the mempool view for a moment.
+            let in_mempool: HashSet<Txid> = mempool.iter().copied().collect();
+            let skip = start.saturating_sub(m);
+            let rows = self.store.history_page(addr, from, to.unwrap_or(u32::MAX), skip, end - start.max(m))?;
+            page.extend(rows.into_iter().map(|h| h.txid).filter(|t| !in_mempool.contains(t)));
+        }
+        Ok((total, page))
     }
 
     /// (balance, totalReceived, totalSent, txs, unconfirmedBalance, unconfirmedTxs) for one address.
@@ -465,15 +507,16 @@ fn paginate(total: usize, q: &ListQuery) -> (usize, usize, usize, usize) {
     (page, total_pages, start, end)
 }
 
-fn history_json(idx: &AddrIndex, txids: &[Txid], q: &ListQuery, details: Details) -> Result<Value, String> {
-    let (page, total_pages, start, end) = paginate(txids.len(), q);
+/// The page `q` asks for of a history of `total` txids; `slice` is that
+/// page's txids.
+fn history_json(idx: &AddrIndex, total: usize, slice: &[Txid], q: &ListQuery, details: Details) -> Result<Value, String> {
+    let (page, total_pages, _, _) = paginate(total, q);
     let mut j = json!({
         "page": page,
         "totalPages": total_pages,
         "itemsOnPage": q.page_size.unwrap_or(DEFAULT_PAGE_SIZE).clamp(1, MAX_PAGE_SIZE),
-        "txs": txids.len(),
+        "txs": total,
     });
-    let slice = &txids[start..end];
     if details == Details::Txids && !slice.is_empty() {
         j["txids"] = json!(slice.iter().map(txid_to_hex).collect::<Vec<_>>());
     }
@@ -501,12 +544,12 @@ async fn address(
             return Err(bad("use /xpub for extended keys"));
         }
         let (bal, recv, sent, _txs, unconf, unconf_txs) = idx.balances(&addr).map_err(internal)?;
-        let txids = if details >= Details::Txids {
-            idx.collect_txids(&[addr.as_str()], q.from.unwrap_or(0), q.to).map_err(internal)?
+        let (total, page) = if details >= Details::Txids {
+            idx.address_txids(&addr, q.from.unwrap_or(0), q.to, &q).map_err(internal)?
         } else {
-            Vec::new()
+            (0, Vec::new())
         };
-        let mut j = history_json(&idx, &txids, &q, details).map_err(internal)?;
+        let mut j = history_json(&idx, total, &page, &q, details).map_err(internal)?;
         if details < Details::Txids {
             j["txs"] = json!(idx.store.stats(&addr).map_err(internal)?.txs + unconf_txs);
         }
@@ -572,8 +615,9 @@ async fn xpub(
         }
 
         let addr_refs: Vec<&str> = used.iter().map(|a| a.address.as_str()).collect();
-        let txids = idx.collect_txids(&addr_refs, q.from.unwrap_or(0), q.to).map_err(internal)?;
-        let mut j = history_json(&idx, &txids, &q, details).map_err(internal)?;
+        let txids = idx.xpub_txids(&xpub, &addr_refs, q.from.unwrap_or(0), q.to).map_err(internal)?;
+        let (_, _, start, end) = paginate(txids.len(), &q);
+        let mut j = history_json(&idx, txids.len(), &txids[start..end], &q, details).map_err(internal)?;
         j["address"] = json!(xpub);
         j["balance"] = json!(bal.to_string());
         j["totalReceived"] = json!(recv.to_string());

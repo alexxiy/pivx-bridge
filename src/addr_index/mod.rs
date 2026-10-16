@@ -83,6 +83,33 @@ impl TxCache {
     }
 }
 
+/// Recent xpub histories (txids, newest first), each valid for the index
+/// tip and mempool sequence it was read at.
+pub struct HistoryCache {
+    entries: VecDeque<(HistoryKey, HistoryVersion, Arc<Vec<Txid>>)>,
+}
+
+/// (xpub, from, to)
+pub type HistoryKey = (String, u32, Option<u32>);
+/// (indexed tip, mempool sequence)
+pub type HistoryVersion = (Option<u32>, u64);
+
+impl HistoryCache {
+    const CAP: usize = 16;
+
+    pub fn get(&self, key: &HistoryKey, version: HistoryVersion) -> Option<Arc<Vec<Txid>>> {
+        self.entries.iter().find(|(k, v, _)| k == key && *v == version).map(|(_, _, t)| t.clone())
+    }
+
+    pub fn put(&mut self, key: HistoryKey, version: HistoryVersion, txids: Arc<Vec<Txid>>) {
+        self.entries.retain(|(k, _, _)| *k != key);
+        if self.entries.len() >= Self::CAP {
+            self.entries.pop_front();
+        }
+        self.entries.push_back((key, version, txids));
+    }
+}
+
 /// Derived-address cache per xpub: chain -> addresses[index].
 pub type XpubCache = HashMap<String, [Vec<String>; 2]>;
 
@@ -110,6 +137,7 @@ pub struct AddrIndex {
     pub node_calls: Arc<tokio::sync::Semaphore>,
     pub tx_cache: Mutex<TxCache>,
     pub xpub_cache: Mutex<XpubCache>,
+    pub history_cache: Mutex<HistoryCache>,
     /// Published after every indexer pass while in sync.
     pub changes: tokio::sync::watch::Sender<WatchState>,
 }
@@ -181,6 +209,7 @@ impl AddrIndex {
             node_calls,
             tx_cache: Mutex::new(TxCache::new(20_000)),
             xpub_cache: Mutex::new(HashMap::new()),
+            history_cache: Mutex::new(HistoryCache { entries: VecDeque::new() }),
             changes: tokio::sync::watch::Sender::new(initial),
         }))
     }

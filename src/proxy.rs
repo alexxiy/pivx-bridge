@@ -97,9 +97,7 @@ pub async fn rpc_proxy(
         };
 
         if let Some(hash) = &block_hash {
-            let verbosity = params.get(1)
-                .and_then(|v| v.as_u64())
-                .unwrap_or(1) as u8;
+            let verbosity = block_verbosity(&params);
             let chain_h = state.chain_height.load(std::sync::atomic::Ordering::Relaxed);
             let cached = state.block_cache.read().unwrap().get(hash, verbosity, chain_h);
             if let Some(json) = cached {
@@ -137,9 +135,7 @@ pub async fn rpc_proxy(
             state.hash_cache.write().unwrap().insert(height, hash.to_string());
 
             // Also populate block cache
-            let verbosity = params.get(1)
-                .and_then(|v| v.as_u64())
-                .unwrap_or(1) as u8;
+            let verbosity = block_verbosity(&params);
             state.block_cache.write().unwrap().insert(hash, verbosity, &result);
         }
     }
@@ -160,6 +156,21 @@ pub async fn rpc_proxy(
         log_timing(start, &method);
     }
     Ok(Json(filtered))
+}
+
+/// `getblock`'s verbosity as pivxd reads it: a number (0 or less is hex,
+/// 2 or more includes the transactions) or a boolean (`false` is hex).
+fn block_verbosity(params: &[Value]) -> u8 {
+    match params.get(1) {
+        None => 1,
+        Some(Value::Bool(verbose)) => u8::from(*verbose),
+        Some(v) => match v.as_i64() {
+            Some(n) if n <= 0 => 0,
+            Some(1) => 1,
+            Some(_) => 2,
+            None => 1,
+        },
+    }
 }
 
 /// Apply an accepted jq filter off the async workers, at most two at once.
@@ -404,6 +415,18 @@ mod tests {
         assert_eq!(params[1], json!(2.5));
         assert_eq!(params[2], json!(true));
         assert_eq!(params[3], json!("hello"));
+    }
+
+    #[test]
+    fn getblock_verbosity_like_pivxd() {
+        let v = |p: &str| block_verbosity(&parse_params(p));
+        assert_eq!(v("abc"), 1);
+        assert_eq!(v("abc,false"), 0);
+        assert_eq!(v("abc,true"), 1);
+        assert_eq!(v("abc,0"), 0);
+        assert_eq!(v("abc,-1"), 0);
+        assert_eq!(v("abc,2"), 2);
+        assert_eq!(v("abc,5"), 2);
     }
 
     #[test]

@@ -606,6 +606,42 @@ impl Store {
         Ok(out)
     }
 
+    /// One page of `addr`'s confirmed history within `[from, to]`, newest
+    /// first: `take` entries after skipping `skip`. Reads only those.
+    pub fn history_page(&self, addr: &str, from: u32, to: u32, skip: usize, take: usize) -> StoreResult<Vec<HistoryEntry>> {
+        let ah = addr_hash(addr);
+        let lo = addr_tx_key(&ah, from, 0, &[0u8; 32]);
+        let hi = addr_tx_key(&ah, to, u32::MAX, &[0xffu8; 32]);
+        let r = self.db.begin_read().map_err(e)?;
+        let t = r.open_table(ADDR_TX).map_err(e)?;
+        let mut out = Vec::with_capacity(take);
+        for item in t.range(&lo[..]..=&hi[..]).map_err(e)?.rev().skip(skip).take(take) {
+            let (k, _) = item.map_err(e)?;
+            let k = k.value();
+            out.push(HistoryEntry {
+                height: u32::from_be_bytes(k[20..24].try_into().unwrap()),
+                txpos: u32::from_be_bytes(k[24..28].try_into().unwrap()),
+                txid: k[28..60].try_into().unwrap(),
+            });
+        }
+        Ok(out)
+    }
+
+    /// Number of entries of `addr`'s confirmed history within `[from, to]`.
+    pub fn history_count(&self, addr: &str, from: u32, to: u32) -> StoreResult<usize> {
+        let ah = addr_hash(addr);
+        let lo = addr_tx_key(&ah, from, 0, &[0u8; 32]);
+        let hi = addr_tx_key(&ah, to, u32::MAX, &[0xffu8; 32]);
+        let r = self.db.begin_read().map_err(e)?;
+        let t = r.open_table(ADDR_TX).map_err(e)?;
+        let mut n = 0;
+        for item in t.range(&lo[..]..=&hi[..]).map_err(e)? {
+            item.map_err(e)?;
+            n += 1;
+        }
+        Ok(n)
+    }
+
     pub fn utxos(&self, addr: &str) -> StoreResult<Vec<UtxoEntry>> {
         let ah = addr_hash(addr);
         let mut lo = [0u8; 56];
