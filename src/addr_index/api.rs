@@ -411,7 +411,11 @@ async fn tx(State(slot): State<Arc<AddrSlot>>, Path(txid): Path<String>) -> ApiR
     let i = idx.clone();
     node_blocking(&i, move || {
         let t = txid_from_hex(&txid).ok_or_else(|| bad("invalid txid"))?;
-        idx.tx_json(&t).map(Json).map_err(|e| ApiError(StatusCode::NOT_FOUND, e))
+        idx.tx_json(&t).map(Json).map_err(|e| {
+            // A node that can't be asked doesn't mean the tx is unknown.
+            let status = if crate::rpc::node_starting(&e) { StatusCode::BAD_GATEWAY } else { StatusCode::NOT_FOUND };
+            ApiError(status, e)
+        })
     })
     .await
 }
@@ -530,8 +534,8 @@ impl AddrIndex {
     /// the mempool stay the same: a wallet asks for page after page, and
     /// an xpub's history has to be read whole to drop the txs its
     /// addresses share.
-    fn xpub_txids(&self, xpub: &str, addrs: &[&str], from: u32, to: Option<u32>) -> Result<Arc<Vec<Txid>>, String> {
-        let key = (xpub.to_string(), from, to);
+    fn xpub_txids(&self, xpub: &str, gap: u32, addrs: &[&str], from: u32, to: Option<u32>) -> Result<Arc<Vec<Txid>>, String> {
+        let key = (xpub.to_string(), from, to, gap);
         let version = (self.indexed_tip(), self.mempool.read().unwrap().seq());
         if let Some(txids) = self.history_cache.lock().unwrap().get(&key, version) {
             return Ok(txids);
@@ -703,7 +707,7 @@ async fn xpub(
         }
 
         let addr_refs: Vec<&str> = used.iter().map(|a| a.address.as_str()).collect();
-        let txids = idx.xpub_txids(&xpub, &addr_refs, q.from.unwrap_or(0), q.to).map_err(internal)?;
+        let txids = idx.xpub_txids(&xpub, gap, &addr_refs, q.from.unwrap_or(0), q.to).map_err(internal)?;
         let (_, _, start, end) = paginate(txids.len(), &q);
         let mut j = history_json(&idx, txids.len(), &txids[start..end], &q, details).map_err(internal)?;
         j["address"] = json!(xpub);

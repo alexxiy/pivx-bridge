@@ -44,10 +44,11 @@ impl<T: Send + 'static> Fetcher<T> {
         let stop = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::sync_channel::<(u32, Result<T, String>)>(256);
         let handles = (0..workers)
-            .map(|_| {
+            .map(|i| {
                 let (read, next, taken, stop, tx, rpc) =
                     (read.clone(), next.clone(), taken.clone(), stop.clone(), tx.clone(), rpc.client());
-                std::thread::spawn(move || {
+                let worker = std::thread::Builder::new().name(format!("fetch-{i}"));
+                worker.spawn(move || {
                     let stopped = || stop.load(Ordering::SeqCst) || shutdown::stopping();
                     while !stopped() {
                         let h = next.fetch_add(1, Ordering::SeqCst);
@@ -71,6 +72,7 @@ impl<T: Send + 'static> Fetcher<T> {
                         }
                     }
                 })
+                .expect("spawn block fetcher")
             })
             .collect();
         Self { rx, waiting: BTreeMap::new(), next: from, to, taken, stop, handles }

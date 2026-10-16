@@ -10,6 +10,25 @@ static STOPPING: AtomicBool = AtomicBool::new(false);
 static THREADS: Mutex<Vec<JoinHandle<()>>> = Mutex::new(Vec::new());
 static WAKERS: Mutex<Vec<mpsc::Sender<()>>> = Mutex::new(Vec::new());
 
+/// Name prefixes of the indexer threads and their block fetchers.
+const INDEXER_THREADS: [&str; 4] = ["shield-", "addr-open-", "addr-index-", "fetch-"];
+
+/// An indexer thread that panicked would leave its index behind for good,
+/// the bridge serving ever older data: exit instead, so the service
+/// manager restarts the bridge (the databases survive a stop at any
+/// point). Panics while answering requests only fail those requests.
+pub fn exit_on_indexer_panic() {
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        hook(info);
+        let name = std::thread::current().name().map(str::to_string).unwrap_or_default();
+        if INDEXER_THREADS.iter().any(|p| name.starts_with(p)) {
+            log::error!("The {name} thread stopped: exiting");
+            std::process::exit(1);
+        }
+    }));
+}
+
 /// Whether the bridge is stopping.
 pub fn stopping() -> bool {
     STOPPING.load(Ordering::Relaxed)

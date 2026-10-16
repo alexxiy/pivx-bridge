@@ -181,7 +181,7 @@ CompactPlus (opt-in):
 
 ```
 src/
-  main.rs         Startup, ZMQ subscribers, routes, axum server
+  main.rs         Startup, ZMQ listener threads, routes, HTTP server with timeouts
   config.rs       CLI args + .env configuration
   rpc.rs          JSON-RPC 1.0 client (auth, connection pooling, batches, 30 s timeout)
   scanner.rs      Block scanner + PIVX v3 Sapling tx parser (validated against PIVX Core)
@@ -244,6 +244,8 @@ The bridge logs to `pivx-bridge.log` in the working directory, nothing to stdout
 ## Stopping and restarting
 
 On SIGTERM (`systemctl stop`) or Ctrl-C the indexers finish the commit they're in and the bridge exits, within 20 s. Every database commit also saves redb's allocator state (quick-repair), so even after a kill or a crash the databases open at once instead of being checked in full. The server starts answering before the address index has opened; until then the index's routes answer 503.
+
+If an indexer thread panics, the bridge logs it and exits with status 1 rather than go on serving data that no longer follows the chain; the systemd unit in `contrib/` restarts it (`Restart=on-failure`). A panic while answering a request only fails that request.
 
 ## Persistence
 

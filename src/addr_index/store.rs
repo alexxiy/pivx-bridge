@@ -52,7 +52,8 @@ pub fn addr_hash(addr: &str) -> AddrHash {
 
 /// Parse a 64-char hex txid (RPC display order) into bytes, same order.
 pub fn txid_from_hex(s: &str) -> Option<Txid> {
-    if s.len() != 64 {
+    // hex_decode doesn't check the digits.
+    if s.len() != 64 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
     let v = crate::hex::hex_decode(s)?;
@@ -654,6 +655,9 @@ impl Store {
 
     /// Confirmed history of `addr` within `[from, to]` heights, ascending.
     pub fn history(&self, addr: &str, from: u32, to: u32) -> StoreResult<Vec<HistoryEntry>> {
+        if from > to {
+            return Ok(Vec::new());
+        }
         let ah = addr_hash(addr);
         let lo = addr_tx_key(&ah, from, 0, &[0u8; 32]);
         let hi = addr_tx_key(&ah, to, u32::MAX, &[0xffu8; 32]);
@@ -675,6 +679,9 @@ impl Store {
     /// One page of `addr`'s confirmed history within `[from, to]`, newest
     /// first: `take` entries after skipping `skip`. Reads only those.
     pub fn history_page(&self, addr: &str, from: u32, to: u32, skip: usize, take: usize) -> StoreResult<Vec<HistoryEntry>> {
+        if from > to {
+            return Ok(Vec::new());
+        }
         let ah = addr_hash(addr);
         let lo = addr_tx_key(&ah, from, 0, &[0u8; 32]);
         let hi = addr_tx_key(&ah, to, u32::MAX, &[0xffu8; 32]);
@@ -695,6 +702,9 @@ impl Store {
 
     /// Number of entries of `addr`'s confirmed history within `[from, to]`.
     pub fn history_count(&self, addr: &str, from: u32, to: u32) -> StoreResult<usize> {
+        if from > to {
+            return Ok(0);
+        }
         let ah = addr_hash(addr);
         let lo = addr_tx_key(&ah, from, 0, &[0u8; 32]);
         let hi = addr_tx_key(&ah, to, u32::MAX, &[0xffu8; 32]);
@@ -767,6 +777,13 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn txids_must_be_hex() {
+        assert_eq!(txid_from_hex(&"ab".repeat(32)), Some([0xab; 32]));
+        assert_eq!(txid_from_hex(&"zz".repeat(32)), None);
+        assert_eq!(txid_from_hex("ab"), None);
+    }
 
     #[test]
     fn the_chain_is_recorded_across_reopens() {

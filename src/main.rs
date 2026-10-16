@@ -119,36 +119,37 @@ fn sapling_params_dir(config: &config::Config) -> Option<std::path::PathBuf> {
     ok.then_some(dir)
 }
 
-/// Wake the shield indexer on every ZMQ hashblock notification.
+/// Wake the shield indexer on every ZMQ hashblock notification, from a
+/// thread of its own. libzmq reconnects to the node by itself; the
+/// subscription is made again only after a message it can't read.
 fn spawn_zmq_listener(label: &'static str, zmq_url: String, trigger: mpsc::Sender<()>) {
-    tokio::spawn(async move {
-        use futures::StreamExt;
+    use std::ops::ControlFlow;
 
-        loop {
+    std::thread::Builder::new()
+        .name(format!("zmq-{label}"))
+        .spawn(move || loop {
             log::info!("[{label}] ZMQ subscribing to {zmq_url}...");
-            let mut subscriber = match bitcoincore_zmq::subscribe_async(&[&zmq_url]) {
-                Ok(s) => s,
+            let subscribed = bitcoincore_zmq::subscribe_blocking(&[&zmq_url], |msg| match msg {
+                Ok(bitcoincore_zmq::Message::HashBlock(_, _)) => {
+                    let _ = trigger.send(());
+                    ControlFlow::Continue(())
+                }
+                Ok(_) => ControlFlow::Continue(()),
+                Err(e) => ControlFlow::Break(e),
+            });
+            match subscribed {
+                Ok(ControlFlow::Break(e)) => {
+                    log::warn!("[{label}] ZMQ error: {e} — reconnecting");
+                    std::thread::sleep(Duration::from_secs(5));
+                }
+                Ok(ControlFlow::Continue(never)) => match never {},
                 Err(e) => {
                     log::warn!("[{label}] ZMQ failed: {e} — checking every 10 s, retrying in 30 s");
-                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-                    continue;
-                }
-            };
-            while let Some(msg) = subscriber.next().await {
-                match msg {
-                    Ok(bitcoincore_zmq::Message::HashBlock(_, _)) => {
-                        let _ = trigger.send(());
-                    }
-                    Ok(_) => {}
-                    Err(e) => {
-                        log::warn!("[{label}] ZMQ error: {e} — reconnecting");
-                        break;
-                    }
+                    std::thread::sleep(Duration::from_secs(30));
                 }
             }
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-        }
-    });
+        })
+        .expect("spawn ZMQ listener");
 }
 
 /// Open the address index in the background, then start its indexer and
@@ -191,6 +192,7 @@ async fn main() {
         eprintln!("pivx-bridge: {e}");
         std::process::exit(1);
     }
+    shutdown::exit_on_indexer_panic();
 
     log::info!("PIVX Bridge v{} starting", env!("CARGO_PKG_VERSION"));
     log::info!("RPC: {}", config.rpc_url);

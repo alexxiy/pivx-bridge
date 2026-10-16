@@ -98,8 +98,8 @@ pub struct HistoryCache {
     entries: VecDeque<(HistoryKey, HistoryVersion, Arc<Vec<Txid>>)>,
 }
 
-/// (xpub, from, to)
-pub type HistoryKey = (String, u32, Option<u32>);
+/// (xpub, from, to, gap): a larger gap may find more used addresses.
+pub type HistoryKey = (String, u32, Option<u32>, u32);
 /// (indexed tip, mempool sequence)
 pub type HistoryVersion = (Option<u32>, u64);
 

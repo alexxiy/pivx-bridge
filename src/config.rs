@@ -2,7 +2,7 @@
 use clap::Parser;
 
 #[derive(Parser, Debug, Clone)]
-#[command(name = "pivx-bridge", about = "PIVX shield sync bridge")]
+#[command(name = "pivx-bridge", version, about = "PIVX shield sync bridge")]
 pub struct Config {
     /// PIVX node RPC URL
     #[arg(long, env = "RPC_URL", default_value = "http://127.0.0.1:51473")]

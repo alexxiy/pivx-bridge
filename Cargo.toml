@@ -1,6 +1,6 @@
 [package]
 name = "pivx-bridge"
-version = "0.5.7"
+version = "0.5.8"
 edition = "2021"
 description = "PIVX shield sync bridge — drop-in replacement for PivxNodeController, written in Rust"
 license = "MIT"
@@ -27,7 +27,7 @@ dotenvy = "0.15"
 log = { version = "0.4.34", features = ["std"] }
 
 # ZMQ block notifications
-bitcoincore-zmq = { version = "1.5", features = ["async"] }
+bitcoincore-zmq = "1.5.4"
 futures = "0.3"
 
 # Utilities
