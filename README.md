@@ -58,22 +58,20 @@ The bridge scans from Sapling activation (block 2,700,501) on first run, then in
 
 ### As a systemd service
 
-```ini
-[Unit]
-Description=PIVX Bridge
-After=network-online.target pivxd.service
+[`contrib/pivx-bridge.service`](contrib/pivx-bridge.service) runs the bridge from `/opt/pivx-bridge` as its own `pivx-bridge` user, after `pivxd.service`, with systemd's sandboxing on. The install steps are at the top of the file:
 
-[Service]
-WorkingDirectory=/var/lib/pivx-bridge
-ExecStart=/usr/local/bin/pivx-bridge
-Restart=on-failure
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
+```bash
+sudo useradd --system --home-dir /opt/pivx-bridge --shell /usr/sbin/nologin pivx-bridge
+sudo install -d -m 750 -o pivx-bridge -g pivx-bridge /opt/pivx-bridge
+sudo install -m 755 target/release/pivx-bridge /opt/pivx-bridge/
+sudo install -m 640 -g pivx-bridge .env.sample /opt/pivx-bridge/.env
+sudo nano /opt/pivx-bridge/.env
+sudo install -m 644 contrib/pivx-bridge.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now pivx-bridge
 ```
 
-`WorkingDirectory` holds `.env` and the data files (see [Persistence](#persistence)). `RestartSec` keeps systemd from using up its restart limit in a second if the bridge does exit.
+`/opt/pivx-bridge` holds the binary, `.env` and the data files (see [Persistence](#persistence)). Home directories are read-only to the service, so put the Sapling parameters somewhere the `pivx-bridge` user can read and set `SAPLING_PARAMS_DIR`.
 
 ## PIVX Node Configuration
 
