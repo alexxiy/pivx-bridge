@@ -37,7 +37,7 @@ ExecStart=/opt/pivx-bridge/pivx-bridge
 Restart=on-failure
 # Keeps systemd from using up its restart limit within a second.
 RestartSec=5
-# Every block is fsynced before it's recorded, so a kill loses nothing.
+# On SIGTERM the indexers finish their commit, within 20 s.
 TimeoutStopSec=30
 # One per open connection: many wallets syncing at once.
 LimitNOFILE=65536

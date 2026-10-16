@@ -20,13 +20,17 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 use crate::rpc::RpcClient;
+use crate::shutdown;
 use mempool::Mempool;
 use store::{Store, Txid};
 
 /// Blocks behind the node tip for which rollback data is kept.
 const UNDO_WINDOW: u32 = 1_000;
-/// Parallel block fetchers used during catch-up.
-const FETCH_WORKERS: usize = 8;
+/// Parallel block fetchers used during catch-up (see the shield indexer's
+/// FETCH_WORKERS for why 4).
+const FETCH_WORKERS: usize = 4;
+/// How far the fetchers may get ahead of the block being stored.
+const LOOKAHEAD: u32 = 1_000;
 /// Blocks per write transaction during catch-up.
 const CATCHUP_BATCH: u32 = 500;
 
@@ -99,6 +103,11 @@ pub struct AddrIndex {
     /// Node tip as last seen by the indexer.
     pub node_tip: AtomicU32,
     pub in_sync: AtomicBool,
+    /// The node is behind the index (logged once).
+    node_behind: AtomicBool,
+    /// Client requests calling the node at once, shared with the
+    /// network's other routes (see `api::node_call`).
+    pub node_calls: Arc<tokio::sync::Semaphore>,
     pub tx_cache: Mutex<TxCache>,
     pub xpub_cache: Mutex<XpubCache>,
     /// Published after every indexer pass while in sync.
@@ -117,7 +126,9 @@ fn node_chain(label: &str, rpc: &RpcClient) -> Result<String, String> {
             Ok(info) => return Ok(info["chain"].as_str().unwrap_or("main").to_string()),
             Err(e) if crate::rpc::node_starting(&e) => {
                 log::info!("[{label}] addr-index: waiting for the node ({e})");
-                std::thread::sleep(NODE_RETRY);
+                if !shutdown::sleep(NODE_RETRY) {
+                    return Err("stopping".into());
+                }
             }
             Err(e) => return Err(e),
         }
@@ -129,7 +140,14 @@ impl AddrIndex {
     /// doesn't need the node, which may still be starting (after a
     /// reboot). Only an index without a recorded chain asks the node,
     /// waiting for it if needed.
-    pub fn open(label: &'static str, path: &str, rpc_url: &str, user: &str, pass: &str) -> Result<Arc<Self>, String> {
+    pub fn open(
+        label: &'static str,
+        path: &str,
+        rpc_url: &str,
+        user: &str,
+        pass: &str,
+        node_calls: Arc<tokio::sync::Semaphore>,
+    ) -> Result<Arc<Self>, String> {
         let rpc = RpcClient::new(rpc_url, user, pass);
         let store = Store::open(path)?;
         let chain = match store.chain()? {
@@ -159,6 +177,8 @@ impl AddrIndex {
             // Set by the indexer's first pass.
             node_tip: AtomicU32::new(0),
             in_sync: AtomicBool::new(false),
+            node_behind: AtomicBool::new(false),
+            node_calls,
             tx_cache: Mutex::new(TxCache::new(20_000)),
             xpub_cache: Mutex::new(HashMap::new()),
             changes: tokio::sync::watch::Sender::new(initial),
@@ -172,15 +192,19 @@ impl AddrIndex {
     /// Spawn the indexer thread (catch-up, follow tip, mempool).
     pub fn spawn(self: &Arc<Self>, rpc_url: String, user: String, pass: String) {
         let idx = self.clone();
-        std::thread::Builder::new()
+        let thread = std::thread::Builder::new()
             .name(format!("addr-index-{}", self.label))
             .spawn(move || {
                 let rpc = RpcClient::new(&rpc_url, &user, &pass);
-                idx.check_chain(&rpc);
-                loop {
+                if !idx.check_chain(&rpc) {
+                    return;
+                }
+                while !shutdown::stopping() {
                     if let Err(e) = idx.sync_blocks(&rpc_url, &user, &pass, &rpc) {
-                        log::warn!("[{}] addr-index: {e} — retrying", idx.label);
-                        std::thread::sleep(Duration::from_secs(5));
+                        if !shutdown::stopping() {
+                            log::warn!("[{}] addr-index: {e} — retrying", idx.label);
+                        }
+                        shutdown::sleep(Duration::from_secs(5));
                         continue;
                     }
                     if idx.in_sync.load(Ordering::Relaxed) {
@@ -189,22 +213,28 @@ impl AddrIndex {
                         }
                         idx.publish_changes();
                     }
-                    std::thread::sleep(Duration::from_secs(2));
+                    shutdown::sleep(Duration::from_secs(2));
                 }
             })
             .expect("spawn addr-index thread");
+        shutdown::register(thread);
     }
 
     /// Once the node answers, exits the process if it is on another chain
     /// than the index (RPC pointed at the wrong network): indexing on would
-    /// roll the whole index back as a reorg.
-    fn check_chain(&self, rpc: &RpcClient) {
+    /// roll the whole index back as a reorg. False when stopping first.
+    fn check_chain(&self, rpc: &RpcClient) -> bool {
         let chain = loop {
+            if shutdown::stopping() {
+                return false;
+            }
             match node_chain(self.label, rpc) {
                 Ok(chain) => break chain,
                 Err(e) => {
-                    log::warn!("[{}] addr-index: {e} — retrying", self.label);
-                    std::thread::sleep(NODE_RETRY);
+                    if !shutdown::stopping() {
+                        log::warn!("[{}] addr-index: {e} — retrying", self.label);
+                    }
+                    shutdown::sleep(NODE_RETRY);
                 }
             }
         };
@@ -216,6 +246,7 @@ impl AddrIndex {
             );
             std::process::exit(1);
         }
+        true
     }
 
     /// Bring the index to the node tip, rolling back on reorgs.
@@ -223,11 +254,34 @@ impl AddrIndex {
         let node_tip = rpc.get_block_count()? as u32;
         self.node_tip.store(node_tip, Ordering::Relaxed);
 
+        // A node behind us on the same chain (after a -reindex, or one
+        // still syncing): wait for it instead of unwinding our blocks.
+        let behind = match self.store.tip()? {
+            Some(tip) if tip > node_tip => {
+                let ours = self.store.block_info(node_tip)?.map(|(h, _)| h);
+                ours.is_some() && ours == Some(rpc.get_block_hash(node_tip)?)
+            }
+            _ => false,
+        };
+        if behind != self.node_behind.swap(behind, Ordering::Relaxed) {
+            if behind {
+                log::info!("[{}] The node is at block {node_tip}, behind the address index (block {}): waiting for it", self.label, self.store.tip()?.unwrap_or(0));
+            } else {
+                log::info!("[{}] The node caught up with the address index", self.label);
+            }
+        }
+        if behind {
+            self.in_sync.store(false, Ordering::Relaxed);
+            return Ok(());
+        }
+
         // Reorg handling: compare our stored hash at our tip with the
-        // node's; we store every block hash so the fork is exact.
+        // node's; we store every block hash so the fork is exact. An RPC
+        // error stops the pass: taken for a different hash, it would undo
+        // good blocks.
         while let Some(tip) = self.store.tip()? {
             let stored = self.store.block_info(tip)?.map(|(h, _)| h).unwrap_or_default();
-            let on_chain = if tip <= node_tip { rpc.get_block_hash(tip).ok() } else { None };
+            let on_chain = if tip <= node_tip { Some(rpc.get_block_hash(tip)?) } else { None };
             if on_chain.as_deref() == Some(stored.as_str()) {
                 break;
             }
@@ -255,28 +309,35 @@ impl AddrIndex {
         let count = to - from + 1;
         let workers = if count > 50 { FETCH_WORKERS } else { 1 };
         let next = Arc::new(AtomicU32::new(from));
+        // The block being stored; fetchers stay within LOOKAHEAD of it.
+        let stored = Arc::new(AtomicU32::new(from));
         let stop = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::sync_channel::<(u32, Result<Value, String>)>(256);
         let mut handles = Vec::new();
         for _ in 0..workers {
             let next = next.clone();
+            let stored = stored.clone();
             let stop = stop.clone();
             let tx = tx.clone();
             let (u, us, p) = (rpc_url.to_string(), user.to_string(), pass.to_string());
             handles.push(std::thread::spawn(move || {
                 let rpc = RpcClient::new(&u, &us, &p);
+                let stopped = || stop.load(Ordering::SeqCst) || shutdown::stopping();
                 loop {
-                    if stop.load(Ordering::SeqCst) {
+                    if stopped() {
                         break;
                     }
                     let h = next.fetch_add(1, Ordering::SeqCst);
                     if h > to {
                         break;
                     }
+                    while h > stored.load(Ordering::SeqCst) + LOOKAHEAD && !stopped() {
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
                     let mut res = Err(String::new());
                     for attempt in 0..3 {
                         res = rpc.get_block_hash(h).and_then(|hash| rpc.get_block(&hash, 2));
-                        if res.is_ok() {
+                        if res.is_ok() || stopped() {
                             break;
                         }
                         std::thread::sleep(Duration::from_millis(500 * (attempt + 1)));
@@ -304,6 +365,9 @@ impl AddrIndex {
         let mut result = Ok(());
 
         'outer: for (h, r) in rx.iter() {
+            if shutdown::stopping() {
+                break;
+            }
             buffer.insert(h, r);
             while let Some(r) = buffer.remove(&expect) {
                 let block = match r {
@@ -327,6 +391,7 @@ impl AddrIndex {
                 }
                 prev_hash = block["hash"].as_str().map(|s| s.to_string());
                 expect += 1;
+                stored.store(expect, Ordering::SeqCst);
                 in_txn += 1;
                 let batch = if near_tip(expect) { 1 } else { CATCHUP_BATCH };
                 if in_txn >= batch {
@@ -360,10 +425,14 @@ impl AddrIndex {
         } else {
             w.abort().map_err(|e| e.to_string())?;
         }
-        for h in handles {
-            let _ = h.join();
+        // When stopping, a fetcher may still wait on the node: don't wait
+        // for it, the blocks stored so far are committed.
+        if !shutdown::stopping() {
+            for h in handles {
+                let _ = h.join();
+            }
         }
-        if count > 10 && result.is_ok() {
+        if count > 10 && result.is_ok() && !shutdown::stopping() {
             log::info!(
                 "[{}] addr-index: indexed {count} blocks in {:.1}s",
                 self.label,

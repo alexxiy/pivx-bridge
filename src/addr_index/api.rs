@@ -30,7 +30,12 @@ const MAX_PAGE_SIZE: usize = 1000;
 const DEFAULT_GAP: u32 = 20;
 const MAX_GAP: u32 = 1000;
 
-pub fn routes(idx: Arc<AddrIndex>) -> Router {
+/// The address index once it's open. It opens after the server starts
+/// listening (a large index may take a while); until then its routes
+/// answer 503.
+pub type AddrSlot = std::sync::OnceLock<Arc<AddrIndex>>;
+
+pub fn routes(slot: Arc<AddrSlot>) -> Router {
     Router::new()
         .route("/status", get(status))
         .route("/address/{address}", get(address))
@@ -41,7 +46,7 @@ pub fn routes(idx: Arc<AddrIndex>) -> Router {
         .route("/sendtx/{hex}", get(send_tx_get))
         .route("/sendtx", post(send_tx_post))
         .route("/watch", post(watch))
-        .with_state(idx)
+        .with_state(slot)
 }
 
 type ApiResult = Result<Json<Value>, ApiError>;
@@ -67,6 +72,23 @@ where
     F: FnOnce() -> ApiResult + Send + 'static,
 {
     tokio::task::spawn_blocking(f).await.map_err(|e| internal(e.to_string()))?
+}
+
+/// [`blocking`] for work that calls the node, within the network's limit
+/// of node calls (see `api::node_call`).
+async fn node_blocking<F>(idx: &AddrIndex, f: F) -> ApiResult
+where
+    F: FnOnce() -> ApiResult + Send + 'static,
+{
+    crate::api::node_call(&idx.node_calls, move || f().map_err(|e| (e.0, e.1)))
+        .await
+        .map_err(|(status, msg)| ApiError(status, msg))
+}
+
+fn ready(slot: &AddrSlot) -> Result<Arc<AddrIndex>, ApiError> {
+    slot.get()
+        .cloned()
+        .ok_or_else(|| ApiError(StatusCode::SERVICE_UNAVAILABLE, "the address index is starting".into()))
 }
 
 #[derive(Deserialize, Default, Clone)]
@@ -107,7 +129,8 @@ impl Details {
 // Status
 // ---------------------------------------------------------------------------
 
-async fn status(State(idx): State<Arc<AddrIndex>>) -> ApiResult {
+async fn status(State(slot): State<Arc<AddrSlot>>) -> ApiResult {
+    let idx = ready(&slot)?;
     blocking(move || {
         let tip = idx.indexed_tip();
         let (best_hash, best_time) = tip
@@ -142,7 +165,8 @@ async fn status(State(idx): State<Arc<AddrIndex>>) -> ApiResult {
     .await
 }
 
-async fn block_index(State(idx): State<Arc<AddrIndex>>, Path(height): Path<u32>) -> ApiResult {
+async fn block_index(State(slot): State<Arc<AddrSlot>>, Path(height): Path<u32>) -> ApiResult {
+    let idx = ready(&slot)?;
     blocking(move || match idx.store.block_info(height).map_err(internal)? {
         Some((hash, _)) => Ok(Json(json!({ "blockHash": hash }))),
         None => Err(ApiError(StatusCode::NOT_FOUND, "block not found".into())),
@@ -314,8 +338,10 @@ impl AddrIndex {
     }
 }
 
-async fn tx(State(idx): State<Arc<AddrIndex>>, Path(txid): Path<String>) -> ApiResult {
-    blocking(move || {
+async fn tx(State(slot): State<Arc<AddrSlot>>, Path(txid): Path<String>) -> ApiResult {
+    let idx = ready(&slot)?;
+    let i = idx.clone();
+    node_blocking(&i, move || {
         let t = txid_from_hex(&txid).ok_or_else(|| bad("invalid txid"))?;
         idx.tx_json(&t).map(Json).map_err(|e| ApiError(StatusCode::NOT_FOUND, e))
     })
@@ -463,15 +489,17 @@ fn history_json(idx: &AddrIndex, txids: &[Txid], q: &ListQuery, details: Details
 }
 
 async fn address(
-    State(idx): State<Arc<AddrIndex>>,
+    State(slot): State<Arc<AddrSlot>>,
     Path(addr): Path<String>,
     Query(q): Query<ListQuery>,
 ) -> ApiResult {
-    blocking(move || {
+    let idx = ready(&slot)?;
+    let details = Details::parse(q.details.as_deref());
+    let i = idx.clone();
+    let work = move || {
         if is_xpub(&addr) {
             return Err(bad("use /xpub for extended keys"));
         }
-        let details = Details::parse(q.details.as_deref());
         let (bal, recv, sent, _txs, unconf, unconf_txs) = idx.balances(&addr).map_err(internal)?;
         let txids = if details >= Details::Txids {
             idx.collect_txids(&[addr.as_str()], q.from.unwrap_or(0), q.to).map_err(internal)?
@@ -489,17 +517,24 @@ async fn address(
         j["unconfirmedBalance"] = json!(unconf.to_string());
         j["unconfirmedTxs"] = json!(unconf_txs);
         Ok(Json(j))
-    })
-    .await
+    };
+    // Transaction details come from the node.
+    if details == Details::Txs {
+        node_blocking(&i, work).await
+    } else {
+        blocking(work).await
+    }
 }
 
 async fn xpub(
-    State(idx): State<Arc<AddrIndex>>,
+    State(slot): State<Arc<AddrSlot>>,
     Path(xpub): Path<String>,
     Query(q): Query<ListQuery>,
 ) -> ApiResult {
-    blocking(move || {
-        let details = Details::parse(q.details.as_deref());
+    let idx = ready(&slot)?;
+    let details = Details::parse(q.details.as_deref());
+    let i = idx.clone();
+    let work = move || {
         let gap = q.gap.unwrap_or(DEFAULT_GAP).clamp(1, MAX_GAP);
         let addrs = idx.xpub_addresses(&xpub, gap).map_err(bad)?;
         let used: Vec<&DerivedAddr> = addrs.iter().filter(|a| a.used).collect();
@@ -550,8 +585,12 @@ async fn xpub(
             j["tokens"] = json!(tokens);
         }
         Ok(Json(j))
-    })
-    .await
+    };
+    if details == Details::Txs {
+        node_blocking(&i, work).await
+    } else {
+        blocking(work).await
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -559,10 +598,11 @@ async fn xpub(
 // ---------------------------------------------------------------------------
 
 async fn utxo(
-    State(idx): State<Arc<AddrIndex>>,
+    State(slot): State<Arc<AddrSlot>>,
     Path(desc): Path<String>,
     Query(q): Query<ListQuery>,
 ) -> ApiResult {
+    let idx = ready(&slot)?;
     blocking(move || {
         let targets: Vec<(String, Option<String>)> = if is_xpub(&desc) {
             let gap = q.gap.unwrap_or(DEFAULT_GAP).clamp(1, MAX_GAP);
@@ -645,12 +685,16 @@ fn broadcast(idx: &AddrIndex, hex: &str) -> ApiResult {
         .map_err(bad)
 }
 
-async fn send_tx_get(State(idx): State<Arc<AddrIndex>>, Path(hex): Path<String>) -> ApiResult {
-    blocking(move || broadcast(&idx, &hex)).await
+async fn send_tx_get(State(slot): State<Arc<AddrSlot>>, Path(hex): Path<String>) -> ApiResult {
+    let idx = ready(&slot)?;
+    let i = idx.clone();
+    node_blocking(&i, move || broadcast(&idx, &hex)).await
 }
 
-async fn send_tx_post(State(idx): State<Arc<AddrIndex>>, body: String) -> ApiResult {
-    blocking(move || broadcast(&idx, &body)).await
+async fn send_tx_post(State(slot): State<Arc<AddrSlot>>, body: String) -> ApiResult {
+    let idx = ready(&slot)?;
+    let i = idx.clone();
+    node_blocking(&i, move || broadcast(&idx, &body)).await
 }
 
 // ---------------------------------------------------------------------------
@@ -680,7 +724,8 @@ pub struct WatchRequest {
 /// seconds. Response: `{height, hash, mempoolSeq, newBlock, txids,
 /// reset, changed}`. `reset` means the client's `mempoolSeq` is unknown
 /// here (bridge restarted or client too far behind): refresh fully.
-async fn watch(State(idx): State<Arc<AddrIndex>>, body: Option<Json<WatchRequest>>) -> ApiResult {
+async fn watch(State(slot): State<Arc<AddrSlot>>, body: Option<Json<WatchRequest>>) -> ApiResult {
+    let idx = ready(&slot)?;
     let req = body.map(|b| b.0).unwrap_or_default();
     if req.addresses.len() > WATCH_MAX_ADDRESSES {
         return Err(bad(format!("too many addresses (max {WATCH_MAX_ADDRESSES})")));

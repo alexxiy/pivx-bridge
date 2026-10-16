@@ -45,6 +45,11 @@ pub struct Config {
     #[arg(long, env = "LISTEN", value_delimiter = ',', value_parser = parse_ip, default_value = "0.0.0.0")]
     pub listen: Vec<std::net::IpAddr>,
 
+    /// Client requests calling the node at once, per network (proxy,
+    /// broadcasts, transaction details); more wait, up to 10 s
+    #[arg(long, env = "NODE_CALLS", default_value_t = 4, value_parser = clap::value_parser!(u32).range(1..))]
+    pub node_calls: u32,
+
     /// Comma-separated list of allowed RPC methods for the proxy
     #[arg(long, env = "ALLOWED_RPCS", default_value = "getblockcount,getblockhash,getblock,getrawtransaction,sendrawtransaction,getmasternodecount,listmasternodes,relaymasternodebroadcast,getnetworkinfo,getbudgetprojection,getbudgetinfo,getbudgetvotes,mnbudgetrawvote,submitbudget")]
     pub allowed_rpcs: String,

@@ -175,7 +175,7 @@ impl ShieldStore {
             file.sync_data().map_err(e)?;
         }
         let cursor = Cursor { height: start_height.saturating_sub(1), hash: String::new() };
-        let w = db.begin_write().map_err(e)?;
+        let w = crate::db::begin_write(db)?;
         {
             w.open_table(BLOCKS).map_err(e)?;
             w.open_table(HASHES).map_err(e)?;
@@ -327,7 +327,7 @@ impl ShieldStore {
         }
 
         let cursor = Cursor { height: last.0, hash: last.1.clone() };
-        let w = self.db.begin_write().map_err(e)?;
+        let w = crate::db::begin_write(&self.db)?;
         {
             let mut table = w.open_table(BLOCKS).map_err(e)?;
             for (h, offsets) in &rows {
@@ -354,7 +354,7 @@ impl ShieldStore {
     pub fn rollback_to(&self, fork: u32) -> Result<(), String> {
         let file = self.file.lock().unwrap();
         let current = *self.lengths.read().unwrap();
-        let w = self.db.begin_write().map_err(e)?;
+        let w = crate::db::begin_write(&self.db)?;
         let lengths;
         let cursor;
         {

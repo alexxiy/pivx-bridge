@@ -113,7 +113,8 @@ pub async fn rpc_proxy(
     // Call the node
     let result = {
         let (state, method, params) = (state.clone(), method.clone(), params.clone());
-        crate::api::blocking(move || state.rpc.proxy_call(&method, &params).map_err(|e| (StatusCode::BAD_GATEWAY, e)))
+        let limit = state.node_calls.clone();
+        crate::api::node_call(&limit, move || state.rpc.proxy_call(&method, &params).map_err(|e| (StatusCode::BAD_GATEWAY, e)))
             .await?
     };
 

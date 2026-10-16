@@ -6,6 +6,7 @@ mod addr_index;
 mod api;
 mod block_cache;
 mod config;
+mod db;
 mod hex;
 mod logging;
 mod proxy;
@@ -13,11 +14,13 @@ mod rpc;
 mod scanner;
 mod shield_store;
 mod shield_sync;
+mod shutdown;
 mod stream;
 
 use std::future::IntoFuture;
-use std::sync::atomic::AtomicU32;
-use std::sync::{mpsc, Arc, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicU32};
+use std::sync::{mpsc, Arc, Mutex, RwLock};
+use std::time::Duration;
 
 use axum::routing::{get, post};
 use axum::Router;
@@ -27,6 +30,7 @@ use tower_http::compression::{predicate::DefaultPredicate, CompressionLayer};
 use tower_http::cors::CorsLayer;
 use tower_http::services::ServeFile;
 
+use addr_index::api::AddrSlot;
 use shield_sync::RpcConfig;
 
 /// Per-network settings.
@@ -59,6 +63,7 @@ fn start_network(cfg: NetworkConfig, config: &config::Config) -> Router {
         cursor.height
     );
 
+    let node_calls = Arc::new(tokio::sync::Semaphore::new(config.node_calls as usize));
     let state = Arc::new(api::AppState {
         label,
         rpc: cfg.rpc.client(),
@@ -67,7 +72,10 @@ fn start_network(cfg: NetworkConfig, config: &config::Config) -> Router {
         hash_cache: RwLock::new(api::HashCache::new(1000)),
         block_cache: RwLock::new(block_cache::BlockCache::new(1000)),
         chain_height: AtomicU32::new(0),
+        node_behind: AtomicBool::new(false),
         jq: proxy::JqPolicy::new(config.jq_filters),
+        node_calls: node_calls.clone(),
+        block_count: Mutex::new(None),
     });
     let trigger = shield_sync::spawn(state.clone(), cfg.rpc.clone());
     match cfg.zmq_url {
@@ -91,7 +99,9 @@ fn start_network(cfg: NetworkConfig, config: &config::Config) -> Router {
             .route_service("/sapling-spend.params", ServeFile::new(dir.join("sapling-spend.params")));
     }
     if let Some(path) = cfg.addr_index_path {
-        routes = routes.merge(start_addr_index(label, &path, &cfg.rpc));
+        let slot = Arc::new(AddrSlot::new());
+        routes = routes.merge(addr_index::api::routes(slot.clone()));
+        start_addr_index(label, path, cfg.rpc, node_calls, slot);
     }
     routes
 }
@@ -141,16 +151,35 @@ fn spawn_zmq_listener(label: &'static str, zmq_url: String, trigger: mpsc::Sende
     });
 }
 
-/// Open the address index, start its indexer thread and return its
-/// routes. Exits the process if the index can't be opened (an operator
+/// Open the address index in the background, then start its indexer and
+/// put it in `slot` for its routes. A large index may take a while to
+/// open; meanwhile the rest of the bridge answers, and the index's routes
+/// say 503. Exits the process if the index can't be opened (an operator
 /// who asked for it should notice). A node that is still starting isn't a
 /// reason: the index waits for it.
-fn start_addr_index(label: &'static str, path: &str, rpc: &RpcConfig) -> Router {
-    let idx = addr_index::AddrIndex::open(label, path, &rpc.url, &rpc.user, &rpc.pass)
-        .unwrap_or_else(|e| panic!("[{label}] address index failed to open: {e}"));
-    idx.spawn(rpc.url.clone(), rpc.user.clone(), rpc.pass.clone());
-    log::info!("[{label}] Address index: enabled");
-    addr_index::api::routes(idx)
+fn start_addr_index(
+    label: &'static str,
+    path: String,
+    rpc: RpcConfig,
+    node_calls: Arc<tokio::sync::Semaphore>,
+    slot: Arc<AddrSlot>,
+) {
+    std::thread::Builder::new()
+        .name(format!("addr-open-{label}"))
+        .spawn(move || {
+            let idx = match addr_index::AddrIndex::open(label, &path, &rpc.url, &rpc.user, &rpc.pass, node_calls) {
+                Ok(idx) => idx,
+                Err(_) if shutdown::stopping() => return,
+                Err(e) => {
+                    log::error!("[{label}] The address index failed to open: {e}");
+                    std::process::exit(1);
+                }
+            };
+            idx.spawn(rpc.url, rpc.user, rpc.pass);
+            let _ = slot.set(idx);
+            log::info!("[{label}] Address index: enabled");
+        })
+        .expect("spawn address index opener");
 }
 
 #[tokio::main]
@@ -231,9 +260,24 @@ async fn main() {
         log::info!("Listening on http://{addr}");
         servers.push(tokio::spawn(axum::serve(listener, app.clone()).into_future()));
     }
-    for server in servers {
-        server.await.expect("server task failed").expect("server error");
+    tokio::select! {
+        results = futures::future::join_all(servers) => {
+            for result in results {
+                result.expect("server task failed").expect("server error");
+            }
+        }
+        () = shutdown::signal() => {}
     }
+
+    // The indexers finish the commit they're in (systemd waits 30 s).
+    log::info!("Stopping");
+    let all = tokio::task::spawn_blocking(|| shutdown::stop(Duration::from_secs(20))).await.unwrap_or(false);
+    if all {
+        log::info!("Stopped");
+    } else {
+        log::warn!("Stopped while an indexer was still waiting on the node (what it stored is saved)");
+    }
+    std::process::exit(0);
 }
 
 /// A listening socket on [addr]. IPv6 ones take IPv6 only, so `0.0.0.0`

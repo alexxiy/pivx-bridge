@@ -3,8 +3,9 @@
 /// All routes are also served under `/mainnet/` for PivxNodeController
 /// compatibility.
 use std::io::{Read, Seek, SeekFrom};
-use std::sync::atomic::AtomicU32;
-use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicU32};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
 
 use axum::body::{Body, Bytes};
 use axum::extract::{Query, State};
@@ -33,7 +34,13 @@ pub struct AppState {
     pub block_cache: RwLock<BlockCache>,
     /// Node tip as last seen by the shield indexer.
     pub chain_height: AtomicU32,
+    /// The node is behind the shield index (logged once).
+    pub node_behind: AtomicBool,
     pub jq: JqPolicy,
+    /// Client requests calling the node at once (see [`node_call`]).
+    pub node_calls: Arc<tokio::sync::Semaphore>,
+    /// `getblockcount`, asked at most once a second.
+    pub block_count: Mutex<Option<(Instant, u64)>>,
 }
 
 /// Fixed-size LRU cache for block height → hash mappings.
@@ -86,6 +93,25 @@ where
     tokio::task::spawn_blocking(f)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+}
+
+/// How long a client request waits for a free node call.
+const NODE_CALL_WAIT: Duration = Duration::from_secs(10);
+
+/// Run blocking work that calls the node, at most `limit` at once. The
+/// node answers few calls at a time (pivxd: 4, queue 16): without a limit
+/// a burst of requests would fill its queue, and the indexers' own calls
+/// would fail. A request that can't get a call within 10 s gets 503.
+pub async fn node_call<T, F>(limit: &tokio::sync::Semaphore, f: F) -> Result<T, (StatusCode, String)>
+where
+    F: FnOnce() -> Result<T, (StatusCode, String)> + Send + 'static,
+    T: Send + 'static,
+{
+    let _permit = match tokio::time::timeout(NODE_CALL_WAIT, limit.acquire()).await {
+        Ok(Ok(permit)) => permit,
+        _ => return Err((StatusCode::SERVICE_UNAVAILABLE, "the node is busy, try again".into())),
+    };
+    blocking(f).await
 }
 
 fn internal(e: String) -> (StatusCode, String) {
@@ -264,14 +290,20 @@ pub async fn get_shield_data_length(
 // GET /getblockcount
 // ---------------------------------------------------------------------------
 
-/// Return the current block height from the node.
+/// Return the current block height from the node (asked at most once a
+/// second: wallets poll it).
 pub async fn get_block_count(State(state): State<Arc<AppState>>) -> Result<String, (StatusCode, String)> {
-    blocking(move || {
-        state
-            .rpc
-            .get_block_count()
-            .map(|c| c.to_string())
-            .map_err(|e| (StatusCode::BAD_GATEWAY, format!("node error: {e}")))
+    let fresh = |cached: &Option<(Instant, u64)>| {
+        cached.filter(|(at, _)| at.elapsed() < Duration::from_secs(1)).map(|(_, count)| count)
+    };
+    if let Some(count) = fresh(&state.block_count.lock().unwrap()) {
+        return Ok(count.to_string());
+    }
+    let s = state.clone();
+    node_call(&state.node_calls, move || {
+        let count = s.rpc.get_block_count().map_err(|e| (StatusCode::BAD_GATEWAY, format!("node error: {e}")))?;
+        *s.block_count.lock().unwrap() = Some((Instant::now(), count));
+        Ok(count.to_string())
     })
     .await
 }
@@ -299,7 +331,8 @@ pub async fn send_raw_transaction(
         return Err((StatusCode::BAD_REQUEST, "invalid transaction hex".into()));
     }
     log::debug!("[broadcast] Received tx hex ({} bytes)", hex.len());
-    blocking(move || match state.rpc.send_raw_transaction(&hex) {
+    let s = state.clone();
+    node_call(&state.node_calls, move || match s.rpc.send_raw_transaction(&hex) {
         Ok(txid) => {
             log::debug!("[broadcast] Sent: {txid}");
             Ok(txid)

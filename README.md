@@ -86,7 +86,13 @@ server=1
 rpcuser=rpc
 rpcpassword=rpc
 zmqpubhashblock=tcp://127.0.0.1:28332
+# More RPC calls at once than pivxd's defaults (4 threads, a queue of 16):
+# the bridge's indexers and the wallets' requests share them.
+rpcthreads=8
+rpcworkqueue=64
 ```
+
+The bridge itself keeps to that: its indexers fetch blocks 4 at a time each, and client requests that call the node (proxy calls, broadcasts, transaction details) run at most `NODE_CALLS` (4) at once per network. Others wait up to 10 s, then get 503. `/getblockcount` asks the node at most once a second.
 
 ## API
 
@@ -210,6 +216,7 @@ All options support both CLI flags and environment variables:
 | `--log-level` | `LOG_LEVEL` | `info` | `error`, `warn`, `info`, or `debug` (adds every RPC proxy call and broadcast txid) |
 | `--log-max-mb` | `LOG_MAX_MB` | `50` | Size at which the log is rotated (`0`: never) |
 | `--log-keep` | `LOG_KEEP` | `5` | Rotated logs kept (`pivx-bridge.log.1` is the newest) |
+| `--node-calls` | `NODE_CALLS` | `4` | Client requests calling the node at once, per network; more wait up to 10 s, then get 503 |
 | `--allowed-rpcs` | `ALLOWED_RPCS` | (see below) | Comma-separated RPC whitelist |
 | `--addr-index` | `ADDR_INDEX` | `false` | Enable the transparent address index |
 | `--sapling-params-dir` | `SAPLING_PARAMS_DIR` | `$HOME/.pivx-params` | Directory with `sapling-{output,spend}.params` to serve |
@@ -228,6 +235,10 @@ The bridge logs to `pivx-bridge.log` in the working directory, nothing to stdout
 ```
 
 `info` logs startup, indexing progress, new shield blocks, reorgs and node problems; `debug` adds a line per RPC proxy call and the txid of each broadcast. Client IPs and the addresses, xpubs and transactions wallets look up are never logged. A panic is logged too, and also goes to stderr so the service manager shows why the bridge stopped. If the log file can't be opened, the bridge says so on stderr and exits.
+
+## Stopping and restarting
+
+On SIGTERM (`systemctl stop`) or Ctrl-C the indexers finish the commit they're in and the bridge exits, within 20 s. Every database commit also saves redb's allocator state (quick-repair), so even after a kill or a crash the databases open at once instead of being checked in full. The server starts answering before the address index has opened; until then the index's routes answer 503.
 
 ## Persistence
 

@@ -275,7 +275,7 @@ impl Store {
         let store = Self { db };
         // Create all tables up front so read transactions never fail
         // with TableDoesNotExist on a fresh database.
-        let w = store.db.begin_write().map_err(e)?;
+        let w = crate::db::begin_write(&store.db)?;
         {
             let mut meta = w.open_table(META).map_err(e)?;
             let existing = meta.get("schema").map_err(e)?.map(|v| v.value().to_vec());
@@ -325,7 +325,7 @@ impl Store {
     }
 
     pub fn set_chain(&self, chain: &str) -> StoreResult<()> {
-        let w = self.db.begin_write().map_err(e)?;
+        let w = crate::db::begin_write(&self.db)?;
         w.open_table(META).map_err(e)?.insert("chain", chain.as_bytes()).map_err(e)?;
         w.commit().map_err(e)
     }
@@ -342,7 +342,7 @@ impl Store {
     }
 
     pub fn begin_write(&self) -> StoreResult<WriteTransaction> {
-        self.db.begin_write().map_err(e)
+        crate::db::begin_write(&self.db)
     }
 
     /// Apply one verbose (verbosity 2) block inside an open write
@@ -468,7 +468,7 @@ impl Store {
     /// for it (reorg deeper than the undo window).
     pub fn undo_tip(&self) -> StoreResult<u32> {
         let tip = self.tip()?.ok_or("nothing to undo")?;
-        let w = self.db.begin_write().map_err(e)?;
+        let w = crate::db::begin_write(&self.db)?;
         {
             let mut undo_t = w.open_table(UNDO).map_err(e)?;
             let rec = undo_t

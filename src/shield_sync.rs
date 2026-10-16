@@ -17,9 +17,16 @@ use crate::api::AppState;
 use crate::rpc::RpcClient;
 use crate::scanner::{self, ShieldBlock};
 use crate::shield_store::HASH_WINDOW;
+use crate::shutdown;
 
-/// Parallel block fetchers used when far behind.
-const FETCH_WORKERS: usize = 8;
+/// Parallel block fetchers used when far behind. pivxd answers 4 RPC
+/// calls at a time by default (`rpcthreads`) and queues 16: the two
+/// indexers and the client requests together stay within that.
+const FETCH_WORKERS: usize = 4;
+/// How far the fetchers may get ahead of the block being stored. Fetched
+/// blocks wait in memory for the ones before them: without a limit, one
+/// slow fetch would let the others fill memory with blocks.
+const LOOKAHEAD: u32 = 1_000;
 /// Scanned blocks per commit during catch-up.
 const COMMIT_EVERY: usize = 1_000;
 /// Within this many blocks of the tip, every block is committed at once.
@@ -45,23 +52,29 @@ impl RpcConfig {
 /// look for new blocks now.
 pub fn spawn(state: Arc<AppState>, rpc: RpcConfig) -> mpsc::Sender<()> {
     let (tx, rx) = mpsc::channel::<()>();
-    std::thread::Builder::new()
+    shutdown::register_waker(tx.clone());
+    let thread = std::thread::Builder::new()
         .name(format!("shield-{}", state.label))
         .spawn(move || {
             let client = rpc.client();
-            loop {
+            while !shutdown::stopping() {
                 if let Err(e) = sync(&state, &client, &rpc) {
                     log::warn!("[{}] shield index: {e} — will retry", state.label);
+                }
+                if shutdown::stopping() {
+                    break;
                 }
                 match rx.recv_timeout(POLL_INTERVAL) {
                     Ok(()) => while rx.try_recv().is_ok() {},
                     Err(mpsc::RecvTimeoutError::Timeout) => {}
-                    // No ZMQ listener holds the sender: just poll.
-                    Err(mpsc::RecvTimeoutError::Disconnected) => std::thread::sleep(POLL_INTERVAL),
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        shutdown::sleep(POLL_INTERVAL);
+                    }
                 }
             }
         })
         .expect("spawn shield indexer");
+    shutdown::register(thread);
     tx
 }
 
@@ -70,6 +83,9 @@ fn sync(state: &AppState, rpc: &RpcClient, cfg: &RpcConfig) -> Result<(), String
     let tip = rpc.get_block_count()? as u32;
     state.chain_height.store(tip, Ordering::Relaxed);
 
+    if node_behind(state, rpc, tip)? {
+        return Ok(());
+    }
     if let Some(fork) = find_fork(state, rpc, tip)? {
         log::info!("[{}] Reorg: rescanning from block {fork}", state.label);
         state.store.rollback_to(fork)?;
@@ -83,6 +99,28 @@ fn sync(state: &AppState, rpc: &RpcClient, cfg: &RpcConfig) -> Result<(), String
         return Ok(());
     }
     index_range(state, cfg, from, tip, cursor.hash)
+}
+
+/// Whether the node is behind the scanned chain on the same chain (after
+/// a `-reindex`, or a node still syncing): then wait for it instead of
+/// taking its lower tip for a reorg. Beyond the kept hashes there's no
+/// telling, and waiting is the safe side too.
+fn node_behind(state: &AppState, rpc: &RpcClient, tip: u32) -> Result<bool, String> {
+    let cursor = state.store.cursor();
+    let behind = cursor.height > tip
+        && !cursor.hash.is_empty()
+        && match state.store.hash_at(tip)? {
+            Some(ours) => ours == rpc.get_block_hash(tip)?,
+            None => true,
+        };
+    if behind != state.node_behind.swap(behind, Ordering::Relaxed) {
+        if behind {
+            log::info!("[{}] The node is at block {tip}, behind the shield index (block {}): waiting for it", state.label, cursor.height);
+        } else {
+            log::info!("[{}] The node caught up with the shield index", state.label);
+        }
+    }
+    Ok(behind)
 }
 
 /// Where the node's chain leaves the scanned one, if it does.
@@ -124,22 +162,28 @@ fn index_range(state: &AppState, cfg: &RpcConfig, from: u32, tip: u32, cursor_ha
 
     let workers = if catching_up { FETCH_WORKERS } else { 1 };
     let next = Arc::new(AtomicU32::new(from));
+    // The block being stored; fetchers stay within LOOKAHEAD of it.
+    let stored = Arc::new(AtomicU32::new(from));
     let stop = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::sync_channel::<(u32, Result<Value, String>)>(256);
     let mut handles = Vec::new();
     for _ in 0..workers {
-        let (next, stop, tx, cfg) = (next.clone(), stop.clone(), tx.clone(), cfg.clone());
+        let (next, stored, stop, tx, cfg) = (next.clone(), stored.clone(), stop.clone(), tx.clone(), cfg.clone());
         handles.push(std::thread::spawn(move || {
             let rpc = cfg.client();
-            while !stop.load(Ordering::SeqCst) {
+            let stopped = || stop.load(Ordering::SeqCst) || shutdown::stopping();
+            while !stopped() {
                 let h = next.fetch_add(1, Ordering::SeqCst);
                 if h > tip {
                     break;
                 }
+                while h > stored.load(Ordering::SeqCst) + LOOKAHEAD && !stopped() {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
                 let mut res = Err(String::new());
                 for attempt in 0..3 {
                     res = rpc.get_block_hash(h).and_then(|hash| rpc.get_block(&hash, 2));
-                    if res.is_ok() {
+                    if res.is_ok() || stopped() {
                         break;
                     }
                     std::thread::sleep(Duration::from_millis(500 * (attempt + 1)));
@@ -170,6 +214,9 @@ fn index_range(state: &AppState, cfg: &RpcConfig, from: u32, tip: u32, cursor_ha
     };
 
     'outer: for (h, r) in rx.iter() {
+        if shutdown::stopping() {
+            break;
+        }
         pending.insert(h, r);
         while let Some(r) = pending.remove(&expect) {
             let block = match r {
@@ -208,6 +255,7 @@ fn index_range(state: &AppState, cfg: &RpcConfig, from: u32, tip: u32, cursor_ha
             scanned.push((expect, hash.clone()));
             prev_hash = Some(hash);
             expect += 1;
+            stored.store(expect, Ordering::SeqCst);
 
             if scanned.len() >= COMMIT_EVERY || expect + TIP_DISTANCE > tip {
                 if let Err(e) = commit(&mut shield, &mut scanned) {
@@ -237,10 +285,14 @@ fn index_range(state: &AppState, cfg: &RpcConfig, from: u32, tip: u32, cursor_ha
             result = result.and(Err(format!("saving blocks: {e}")));
         }
     }
-    for h in handles {
-        let _ = h.join();
+    // When stopping, a fetcher may still wait on the node: don't wait
+    // for it, what was scanned is saved.
+    if !shutdown::stopping() {
+        for h in handles {
+            let _ = h.join();
+        }
     }
-    if catching_up && result.is_ok() {
+    if catching_up && result.is_ok() && !shutdown::stopping() {
         log::info!(
             "[{}] Shield index: scanned {count} blocks in {:.0} s ({found} shield blocks, {} in total)",
             state.label,
