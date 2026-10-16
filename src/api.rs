@@ -298,14 +298,14 @@ pub async fn send_raw_transaction(
     if hex.is_empty() || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err((StatusCode::BAD_REQUEST, "invalid transaction hex".into()));
     }
-    eprintln!("  [broadcast] Received tx hex ({} bytes)", hex.len());
+    log::debug!("[broadcast] Received tx hex ({} bytes)", hex.len());
     blocking(move || match state.rpc.send_raw_transaction(&hex) {
         Ok(txid) => {
-            eprintln!("  [broadcast] Success: {txid}");
+            log::debug!("[broadcast] Sent: {txid}");
             Ok(txid)
         }
         Err(e) => {
-            eprintln!("  [broadcast] FAILED: {e}");
+            log::info!("[broadcast] Rejected by the node: {e}");
             Err((StatusCode::BAD_REQUEST, e))
         }
     })

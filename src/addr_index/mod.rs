@@ -116,7 +116,7 @@ fn node_chain(label: &str, rpc: &RpcClient) -> Result<String, String> {
         match rpc.proxy_call("getblockchaininfo", &[]) {
             Ok(info) => return Ok(info["chain"].as_str().unwrap_or("main").to_string()),
             Err(e) if crate::rpc::node_starting(&e) => {
-                eprintln!("  [{label}] addr-index: waiting for the node ({e})");
+                log::info!("[{label}] addr-index: waiting for the node ({e})");
                 std::thread::sleep(NODE_RETRY);
             }
             Err(e) => return Err(e),
@@ -146,8 +146,8 @@ impl AddrIndex {
             hash: tip.and_then(|t| store.block_info(t).ok().flatten()).map(|(h, _)| h).unwrap_or_default(),
             mempool_seq: 0,
         };
-        eprintln!(
-            "  [{label}] Address index: {path} (chain={chain}, indexed tip={})",
+        log::info!(
+            "[{label}] Address index: {path} (chain={chain}, indexed tip={})",
             tip.map(|t| t.to_string()).unwrap_or_else(|| "none".into())
         );
         Ok(Arc::new(Self {
@@ -179,13 +179,13 @@ impl AddrIndex {
                 idx.check_chain(&rpc);
                 loop {
                     if let Err(e) = idx.sync_blocks(&rpc_url, &user, &pass, &rpc) {
-                        eprintln!("  [{}] addr-index: {e} — retrying", idx.label);
+                        log::warn!("[{}] addr-index: {e} — retrying", idx.label);
                         std::thread::sleep(Duration::from_secs(5));
                         continue;
                     }
                     if idx.in_sync.load(Ordering::Relaxed) {
                         if let Err(e) = idx.sync_mempool(&rpc) {
-                            eprintln!("  [{}] addr-index mempool: {e}", idx.label);
+                            log::warn!("[{}] addr-index mempool: {e}", idx.label);
                         }
                         idx.publish_changes();
                     }
@@ -203,14 +203,14 @@ impl AddrIndex {
             match node_chain(self.label, rpc) {
                 Ok(chain) => break chain,
                 Err(e) => {
-                    eprintln!("  [{}] addr-index: {e} — retrying", self.label);
+                    log::warn!("[{}] addr-index: {e} — retrying", self.label);
                     std::thread::sleep(NODE_RETRY);
                 }
             }
         };
         if chain != self.net.chain {
-            eprintln!(
-                "  [{}] Address index holds chain {} but the node is on {chain}: fix the RPC settings, \
+            log::error!(
+                "[{}] Address index holds chain {} but the node is on {chain}: fix the RPC settings, \
                  or delete the index to rebuild it for this node",
                 self.label, self.net.chain
             );
@@ -233,7 +233,7 @@ impl AddrIndex {
             }
             let undone = self.store.undo_tip()?;
             self.tx_cache.lock().unwrap().map.clear();
-            eprintln!("  [{}] addr-index: reorg — rolled back block {undone}", self.label);
+            log::info!("[{}] addr-index: reorg — rolled back block {undone}", self.label);
         }
 
         let from = self.store.tip()?.map(|t| t + 1).unwrap_or(0);
@@ -244,7 +244,7 @@ impl AddrIndex {
         let behind = node_tip - from + 1;
         if behind > 10 {
             self.in_sync.store(false, Ordering::Relaxed);
-            eprintln!("  [{}] addr-index: catching up {from}..{node_tip} ({behind} blocks)", self.label);
+            log::info!("[{}] addr-index: catching up {from}..{node_tip} ({behind} blocks)", self.label);
         }
         self.catch_up(rpc_url, user, pass, from, node_tip)?;
         self.in_sync.store(self.store.tip()? == Some(node_tip), Ordering::Relaxed);
@@ -341,8 +341,8 @@ impl AddrIndex {
                     let done = expect - from;
                     let rate = done as f64 / started.elapsed().as_secs_f64().max(0.001);
                     let eta = (to + 1 - expect) as f64 / rate.max(0.001);
-                    eprintln!(
-                        "  [{}] addr-index: {}/{} ({rate:.0} blk/s, ETA {:.0} min)",
+                    log::info!(
+                        "[{}] addr-index: {}/{} ({rate:.0} blk/s, ETA {:.0} min)",
                         self.label,
                         expect - 1,
                         to,
@@ -364,8 +364,8 @@ impl AddrIndex {
             let _ = h.join();
         }
         if count > 10 && result.is_ok() {
-            eprintln!(
-                "  [{}] addr-index: indexed {count} blocks in {:.1}s",
+            log::info!(
+                "[{}] addr-index: indexed {count} blocks in {:.1}s",
                 self.label,
                 started.elapsed().as_secs_f64()
             );

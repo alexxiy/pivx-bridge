@@ -106,7 +106,7 @@ pub fn scan_block_json(block_json: &serde_json::Value) -> Result<Option<ShieldBl
             Ok(None) => {}
             Err(e) => {
                 let txid = tx.get("txid").and_then(|t| t.as_str()).unwrap_or("?");
-                eprintln!("  Warning: block {height} tx {txid}: not parsed as Sapling ({e}), skipped");
+                log::warn!("Block {height} tx {txid}: not parsed as Sapling ({e}), skipped");
             }
         }
     }

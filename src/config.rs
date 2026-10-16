@@ -80,6 +80,22 @@ pub struct Config {
     #[arg(long, env = "SAPLING_PARAMS_DIR")]
     pub sapling_params_dir: Option<String>,
 
+    /// Log file; `-` for stderr
+    #[arg(long, env = "LOG_FILE", default_value = "pivx-bridge.log")]
+    pub log_file: String,
+
+    /// error, warn, info, or debug (adds every RPC proxy call and broadcast)
+    #[arg(long, env = "LOG_LEVEL", default_value = "info")]
+    pub log_level: log::LevelFilter,
+
+    /// Size in MB at which the log file is rotated (0: never)
+    #[arg(long, env = "LOG_MAX_MB", default_value_t = 50)]
+    pub log_max_mb: u64,
+
+    /// Rotated log files kept (pivx-bridge.log.1 ...)
+    #[arg(long, env = "LOG_KEEP", default_value_t = 5)]
+    pub log_keep: u32,
+
     /// Disable gzip compression of JSON answers (use when behind nginx or
     /// another compressing proxy). Shield data is never compressed.
     #[arg(long, env = "NO_COMPRESSION")]

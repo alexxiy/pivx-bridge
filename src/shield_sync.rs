@@ -51,7 +51,7 @@ pub fn spawn(state: Arc<AppState>, rpc: RpcConfig) -> mpsc::Sender<()> {
             let client = rpc.client();
             loop {
                 if let Err(e) = sync(&state, &client, &rpc) {
-                    eprintln!("  [{}] shield index: {e} — will retry", state.label);
+                    log::warn!("[{}] shield index: {e} — will retry", state.label);
                 }
                 match rx.recv_timeout(POLL_INTERVAL) {
                     Ok(()) => while rx.try_recv().is_ok() {},
@@ -71,7 +71,7 @@ fn sync(state: &AppState, rpc: &RpcClient, cfg: &RpcConfig) -> Result<(), String
     state.chain_height.store(tip, Ordering::Relaxed);
 
     if let Some(fork) = find_fork(state, rpc, tip)? {
-        eprintln!("  [{}] Reorg: rescanning from block {fork}", state.label);
+        log::info!("[{}] Reorg: rescanning from block {fork}", state.label);
         state.store.rollback_to(fork)?;
         state.block_cache.write().unwrap().invalidate_from(fork);
         state.hash_cache.write().unwrap().invalidate_from(fork);
@@ -107,8 +107,8 @@ fn find_fork(state: &AppState, rpc: &RpcClient, tip: u32) -> Result<Option<u32>,
         }
         h -= 1;
     }
-    eprintln!(
-        "  [{}] WARN: no common block in the last {HASH_WINDOW} blocks; rescanning from {}",
+    log::warn!(
+        "[{}] No common block in the last {HASH_WINDOW} blocks; rescanning from {}",
         state.label,
         lowest.max(1)
     );
@@ -119,7 +119,7 @@ fn index_range(state: &AppState, cfg: &RpcConfig, from: u32, tip: u32, cursor_ha
     let count = tip - from + 1;
     let catching_up = count > 50;
     if catching_up {
-        eprintln!("  [{}] Shield index: scanning blocks {from}..{tip} ({count} blocks)", state.label);
+        log::info!("[{}] Shield index: scanning blocks {from}..{tip} ({count} blocks)", state.label);
     }
 
     let workers = if catching_up { FETCH_WORKERS } else { 1 };
@@ -190,7 +190,7 @@ fn index_range(state: &AppState, cfg: &RpcConfig, from: u32, tip: u32, cursor_ha
             match scanner::scan_block_json(&block) {
                 Ok(Some(b)) => {
                     if !catching_up {
-                        eprintln!("  [{}] Indexed shield block {expect} ({} tx)", state.label, b.txs.len());
+                        log::info!("[{}] Indexed shield block {expect} ({} tx)", state.label, b.txs.len());
                     }
                     found += 1;
                     shield.push(b);
@@ -219,8 +219,8 @@ fn index_range(state: &AppState, cfg: &RpcConfig, from: u32, tip: u32, cursor_ha
                 let done = expect - from;
                 let rate = done as f64 / started.elapsed().as_secs_f64().max(0.001);
                 let eta = (tip + 1 - expect) as f64 / rate.max(0.001);
-                eprintln!(
-                    "  [{}] Shield index: {}/{tip} ({rate:.0} blk/s, ETA {:.0} min, {found} shield blocks found)",
+                log::info!(
+                    "[{}] Shield index: {}/{tip} ({rate:.0} blk/s, ETA {:.0} min, {found} shield blocks found)",
                     state.label,
                     expect - 1,
                     eta / 60.0
@@ -241,8 +241,8 @@ fn index_range(state: &AppState, cfg: &RpcConfig, from: u32, tip: u32, cursor_ha
         let _ = h.join();
     }
     if catching_up && result.is_ok() {
-        eprintln!(
-            "  [{}] Shield index: scanned {count} blocks in {:.0} s ({found} shield blocks, {} in total)",
+        log::info!(
+            "[{}] Shield index: scanned {count} blocks in {:.0} s ({found} shield blocks, {} in total)",
             state.label,
             started.elapsed().as_secs_f64(),
             state.store.block_count().unwrap_or(0)

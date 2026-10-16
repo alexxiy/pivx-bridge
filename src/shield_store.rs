@@ -170,7 +170,7 @@ impl ShieldStore {
     /// (another version, PivxNodeController) is not trusted: scan anew.
     fn initialise(label: &str, db: &Database, file: &mut File, bin_path: &str, start_height: u32) -> Result<(), String> {
         if file.metadata().map_err(e)?.len() > 0 {
-            eprintln!("  [{label}] {bin_path} has no index: rebuilding it from block {start_height}");
+            log::info!("[{label}] {bin_path} has no index: rebuilding it from block {start_height}");
             file.set_len(0).map_err(e)?;
             file.sync_data().map_err(e)?;
         }
@@ -195,8 +195,8 @@ impl ShieldStore {
         let actual = file.metadata().map_err(e)?.len();
         let committed = self.lengths.read().unwrap().pivx;
         if actual > committed {
-            eprintln!(
-                "  [{}] Cutting {} uncommitted bytes from the end of {}",
+            log::info!(
+                "[{}] Cutting {} uncommitted bytes from the end of {}",
                 self.label,
                 actual - committed,
                 self.bin_path.display()
@@ -225,8 +225,8 @@ impl ShieldStore {
             drop(r);
             drop(file);
             let fork = first_incomplete.or(last_started).unwrap_or(0);
-            eprintln!(
-                "  [{}] WARN: {} is shorter than its index ({actual} < {committed}); rescanning from {fork}",
+            log::warn!(
+                "[{}] {} is shorter than its index ({actual} < {committed}); rescanning from {fork}",
                 self.label,
                 self.bin_path.display()
             );

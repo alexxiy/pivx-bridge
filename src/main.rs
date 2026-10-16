@@ -7,6 +7,7 @@ mod api;
 mod block_cache;
 mod config;
 mod hex;
+mod logging;
 mod proxy;
 mod rpc;
 mod scanner;
@@ -52,8 +53,8 @@ fn start_network(cfg: NetworkConfig, config: &config::Config) -> Router {
     )
     .unwrap_or_else(|e| panic!("[{label}] shield store: {e}"));
     let cursor = store.cursor();
-    eprintln!(
-        "  [{label}] Shield store: {} shield blocks, scanned to {}",
+    log::info!(
+        "[{label}] Shield store: {} shield blocks, scanned to {}",
         store.block_count().unwrap_or(0),
         cursor.height
     );
@@ -71,7 +72,7 @@ fn start_network(cfg: NetworkConfig, config: &config::Config) -> Router {
     let trigger = shield_sync::spawn(state.clone(), cfg.rpc.clone());
     match cfg.zmq_url {
         Some(url) => spawn_zmq_listener(label, url, trigger),
-        None => eprintln!("  [{label}] No ZMQ endpoint: checking for blocks every 10 s"),
+        None => log::info!("[{label}] No ZMQ endpoint: checking for blocks every 10 s"),
     }
 
     let mut routes = Router::new()
@@ -114,11 +115,11 @@ fn spawn_zmq_listener(label: &'static str, zmq_url: String, trigger: mpsc::Sende
         use futures::StreamExt;
 
         loop {
-            eprintln!("  [{label}] ZMQ subscribing to {zmq_url}...");
+            log::info!("[{label}] ZMQ subscribing to {zmq_url}...");
             let mut subscriber = match bitcoincore_zmq::subscribe_async(&[&zmq_url]) {
                 Ok(s) => s,
                 Err(e) => {
-                    eprintln!("  [{label}] ZMQ failed: {e} — checking every 10 s, retrying in 30 s");
+                    log::warn!("[{label}] ZMQ failed: {e} — checking every 10 s, retrying in 30 s");
                     tokio::time::sleep(std::time::Duration::from_secs(30)).await;
                     continue;
                 }
@@ -130,7 +131,7 @@ fn spawn_zmq_listener(label: &'static str, zmq_url: String, trigger: mpsc::Sende
                     }
                     Ok(_) => {}
                     Err(e) => {
-                        eprintln!("  [{label}] ZMQ error: {e} — reconnecting");
+                        log::warn!("[{label}] ZMQ error: {e} — reconnecting");
                         break;
                     }
                 }
@@ -148,7 +149,7 @@ fn start_addr_index(label: &'static str, path: &str, rpc: &RpcConfig) -> Router 
     let idx = addr_index::AddrIndex::open(label, path, &rpc.url, &rpc.user, &rpc.pass)
         .unwrap_or_else(|e| panic!("[{label}] address index failed to open: {e}"));
     idx.spawn(rpc.url.clone(), rpc.user.clone(), rpc.pass.clone());
-    eprintln!("  [{label}] Address index: enabled");
+    log::info!("[{label}] Address index: enabled");
     addr_index::api::routes(idx)
 }
 
@@ -156,17 +157,17 @@ fn start_addr_index(label: &'static str, path: &str, rpc: &RpcConfig) -> Router 
 async fn main() {
     let _ = dotenvy::dotenv();
     let config = config::Config::parse();
+    if let Err(e) = logging::init(&config) {
+        eprintln!("pivx-bridge: {e}");
+        std::process::exit(1);
+    }
 
-    eprintln!("╔══════════════════════════════════════════╗");
-    eprintln!("║          PIVX Bridge v{}           ║", env!("CARGO_PKG_VERSION"));
-    eprintln!("╠══════════════════════════════════════════╣");
-    eprintln!("║  RPC:  {}  ", config.rpc_url);
-    eprintln!("║  ZMQ:  {}  ", config.zmq_url);
-    eprintln!("║  Port: {}                            ", config.port);
-    eprintln!("╚══════════════════════════════════════════╝");
+    log::info!("PIVX Bridge v{} starting", env!("CARGO_PKG_VERSION"));
+    log::info!("RPC: {}", config.rpc_url);
+    log::info!("ZMQ: {}", config.zmq_url);
     match sapling_params_dir(&config) {
-        Some(d) => eprintln!("  Sapling params: serving from {}", d.display()),
-        None => eprintln!("  Sapling params: not found (set SAPLING_PARAMS_DIR to serve them)"),
+        Some(d) => log::info!("Sapling params: serving from {}", d.display()),
+        None => log::info!("Sapling params: not found (set SAPLING_PARAMS_DIR to serve them)"),
     }
 
     // -- Mainnet --
@@ -205,20 +206,20 @@ async fn main() {
             &config,
         );
         app = app.nest("/testnet", testnet_routes);
-        eprintln!("  Testnet: enabled at /testnet/");
+        log::info!("Testnet: enabled at /testnet/");
     }
 
     // -- Layers --
     let app = app.layer(CorsLayer::permissive());
 
     let app = if config.no_compression {
-        eprintln!("  Compression: OFF");
+        log::info!("Compression: off");
         app.into_make_service()
     } else {
         // Shield data and Sapling params are random-looking (gzip saves
         // under 2 %) and large: compressing them only costs CPU and delays
         // the first byte. JSON answers are compressed.
-        eprintln!("  Compression: gzip for JSON (disable with --no-compression)");
+        log::info!("Compression: gzip for JSON (NO_COMPRESSION=true turns it off)");
         let predicate = DefaultPredicate::new().and(NotForContentType::const_new("application/octet-stream"));
         app.layer(CompressionLayer::new().compress_when(predicate)).into_make_service()
     };
@@ -227,7 +228,7 @@ async fn main() {
     for ip in &config.listen {
         let addr = std::net::SocketAddr::new(*ip, config.port);
         let listener = bind(addr).unwrap_or_else(|e| panic!("failed to listen on {addr}: {e}"));
-        eprintln!("  Listening on http://{addr}");
+        log::info!("Listening on http://{addr}");
         servers.push(tokio::spawn(axum::serve(listener, app.clone()).into_future()));
     }
     for server in servers {

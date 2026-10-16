@@ -155,7 +155,7 @@ impl BlockCache {
         }
 
         if count > 0 {
-            eprintln!("  [block_cache] Invalidated {count} block(s) from height {fork_height}");
+            log::info!("[block_cache] Invalidated {count} block(s) from height {fork_height}");
         }
     }
 

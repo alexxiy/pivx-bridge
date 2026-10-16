@@ -146,17 +146,14 @@ pub async fn rpc_proxy(
     let filtered = run_filter(&state, result, filter.as_deref()).await?;
 
     // Log timing + cache stats for getblock
-    if method == "getblock" {
+    if method == "getblock" && log::log_enabled!(log::Level::Debug) {
         let (hits, misses, cached) = state.block_cache.read().unwrap().stats();
-        use std::io::Write;
         let ms = start.elapsed().as_secs_f64() * 1000.0;
-        let stderr = std::io::stderr();
-        let mut w = stderr.lock();
         let total = hits + misses;
         if ms >= 1.0 {
-            let _ = writeln!(w, "  [proxy {ms:.0}ms] {method} (cache: {hits}/{total} hits, {cached} blocks)");
+            log::debug!("[proxy {ms:.0}ms] {method} (cache: {hits}/{total} hits, {cached} blocks)");
         } else {
-            let _ = writeln!(w, "  [proxy {ms:.2}ms] {method} (cache: {hits}/{total} hits, {cached} blocks)");
+            log::debug!("[proxy {ms:.2}ms] {method} (cache: {hits}/{total} hits, {cached} blocks)");
         }
     } else {
         log_timing(start, &method);
@@ -250,18 +247,15 @@ fn strip_whitespace(expr: &str) -> Option<String> {
     (!in_string).then_some(out)
 }
 
-/// Write elapsed time directly to stderr — no allocation.
+/// Log (debug) how long a proxy call took.
 pub fn log_timing(start: std::time::Instant, label: &str) {
-    use std::io::Write;
     let ms = start.elapsed().as_secs_f64() * 1000.0;
-    let stderr = std::io::stderr();
-    let mut w = stderr.lock();
     if ms >= 1000.0 {
-        let _ = writeln!(w, "  [proxy {:.1}s] {label}", ms / 1000.0);
+        log::debug!("[proxy {:.1}s] {label}", ms / 1000.0);
     } else if ms >= 1.0 {
-        let _ = writeln!(w, "  [proxy {:.0}ms] {label}", ms);
+        log::debug!("[proxy {:.0}ms] {label}", ms);
     } else {
-        let _ = writeln!(w, "  [proxy {:.2}ms] {label}", ms);
+        log::debug!("[proxy {:.2}ms] {label}", ms);
     }
 }
 

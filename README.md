@@ -206,6 +206,10 @@ All options support both CLI flags and environment variables:
 | `--testnet-sapling-height` | `TESTNET_SAPLING_HEIGHT` | `501` | Sapling activation block on testnet |
 | `--jq-filters` | `JQ_FILTERS` | `known` | Which proxy `filter`s run: `known`, `any` or `off` |
 | `--no-compression` | `NO_COMPRESSION` | `false` | Disable gzip of JSON answers (use behind nginx) |
+| `--log-file` | `LOG_FILE` | `pivx-bridge.log` | Log file, `-` for stderr |
+| `--log-level` | `LOG_LEVEL` | `info` | `error`, `warn`, `info`, or `debug` (adds every RPC proxy call and broadcast txid) |
+| `--log-max-mb` | `LOG_MAX_MB` | `50` | Size at which the log is rotated (`0`: never) |
+| `--log-keep` | `LOG_KEEP` | `5` | Rotated logs kept (`pivx-bridge.log.1` is the newest) |
 | `--allowed-rpcs` | `ALLOWED_RPCS` | (see below) | Comma-separated RPC whitelist |
 | `--addr-index` | `ADDR_INDEX` | `false` | Enable the transparent address index |
 | `--sapling-params-dir` | `SAPLING_PARAMS_DIR` | `$HOME/.pivx-params` | Directory with `sapling-{output,spend}.params` to serve |
@@ -213,6 +217,17 @@ All options support both CLI flags and environment variables:
 | `--testnet-addr-index-path` | `TESTNET_ADDR_INDEX_PATH` | `addr_index.testnet.redb` | Address index database (testnet) |
 
 Default allowed RPCs: `getblockcount`, `getblockhash`, `getblock`, `getrawtransaction`, `sendrawtransaction`, `getmasternodecount`, `listmasternodes`, `relaymasternodebroadcast`, `getnetworkinfo`, `getbudgetprojection`, `getbudgetinfo`, `getbudgetvotes`, `mnbudgetrawvote`, `submitbudget`
+
+## Logging
+
+The bridge logs to `pivx-bridge.log` in the working directory, nothing to stdout or stderr (`LOG_FILE=-` logs to stderr instead). Each line has a UTC timestamp and a level:
+
+```
+2026-10-16 14:06:39.709Z INFO  Listening on http://127.0.0.1:3000
+2026-10-16 14:06:45.735Z DEBUG [proxy 0.48ms] getblockhash
+```
+
+`info` logs startup, indexing progress, new shield blocks, reorgs and node problems; `debug` adds a line per RPC proxy call and the txid of each broadcast. Client IPs and the addresses, xpubs and transactions wallets look up are never logged. A panic is logged too, and also goes to stderr so the service manager shows why the bridge stopped. If the log file can't be opened, the bridge says so on stderr and exits.
 
 ## Persistence
 
