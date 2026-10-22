@@ -1,6 +1,6 @@
 [package]
 name = "pivx-bridge"
-version = "0.5.8"
+version = "0.5.9"
 edition = "2021"
 description = "PIVX shield sync bridge — drop-in replacement for PivxNodeController, written in Rust"
 license = "MIT"
@@ -8,14 +8,14 @@ license = "MIT"
 [dependencies]
 # HTTP server
 axum = "0.8.9"
-tokio = { version = "1.53", features = ["full"] }
+tokio = { version = "1.54", features = ["full"] }
 tower-http = { version = "0.7.1", features = ["cors", "compression-gzip", "fs", "timeout"] }
 socket2 = "0.6.5"
 # Connections with timeouts (axum::serve sets none)
 hyper-util = { version = "0.1.21", features = ["server-auto", "service", "tokio"] }
 
 # RPC client (blocking — used in spawn_blocking)
-ureq = "3.4"
+ureq = "3.5"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -34,7 +34,7 @@ futures = "0.3"
 sha2 = "0.11"
 
 # Transparent address index
-redb = "4.3"
+redb = "4.4"
 k256 = { version = "0.14", default-features = false, features = ["arithmetic", "std"] }
 hmac = "0.13"
 ripemd = "0.2"
