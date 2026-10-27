@@ -72,11 +72,11 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now pivx-bridge
 ```
 
-`/opt/pivx-bridge` holds the binary, `.env` and the data files (see [Persistence](#persistence)). Home directories are read-only to the service, so put the Sapling parameters somewhere the `pivx-bridge` user can read and set `SAPLING_PARAMS_DIR`.
+`/opt/pivx-bridge` holds the binary, `.env` and the data files (see [Persistence](#persistence)). Home directories are read-only to the service, so put the Sapling parameters somewhere the `pivx-bridge` user can read and set `SAPLING_PARAMS_DIR`. `/opt/sapling-params` (mode 755, files 644) works for the bridge and for nginx.
 
 ### Behind nginx
 
-[`contrib/nginx-pivx-bridge.conf`](contrib/nginx-pivx-bridge.conf) puts HTTPS, HTTP/2 and gzip (brotli too, if your nginx has the module) in front of a bridge listening on localhost only (`LISTEN=127.0.0.1`, `NO_COMPRESSION=true`). It takes long transaction URLs, streams shield data straight through and keeps `/watch` long-polls open. It also keeps addresses and xpubs out of the access log.
+[`contrib/nginx-pivx-bridge.conf`](contrib/nginx-pivx-bridge.conf) puts HTTPS, HTTP/2 and gzip (brotli too, if your nginx has the module) in front of a bridge listening on localhost only (`LISTEN=127.0.0.1`, `NO_COMPRESSION=true`). It takes long transaction URLs, streams shield data straight through, keeps `/watch` long-polls open and sends the Sapling parameters from disk itself (from `/opt/sapling-params`). It keeps addresses and xpubs out of nginx's logs and client IPs away from the bridge. Each open wallet holds a `/watch` request and two nginx connections, so raise `worker_connections` in `nginx.conf` as the config's header says.
 
 Exposed directly, the bridge closes connections that send no request within 30 s (idle kept-alive ones too), and requests whose body stalls for 30 s. Behind nginx the same 30 s applies to nginx's own connections, which nginx keeps idle for 60 s unless told otherwise. The sample config sets `keepalive_timeout 25s` in its `upstream` block for this; keep that line in your own config.
 
