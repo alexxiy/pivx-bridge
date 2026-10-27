@@ -275,4 +275,4 @@ The bridge builds its own shield data on first start (it does not reuse PivxNode
 
 ## License
 
-MIT
+MIT, see [LICENSE](LICENSE).
