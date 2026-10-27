@@ -1,6 +1,6 @@
 [package]
 name = "pivx-bridge"
-version = "0.5.9"
+version = "0.5.10"
 edition = "2021"
 description = "PIVX shield sync bridge — drop-in replacement for PivxNodeController, written in Rust"
 license = "MIT"
