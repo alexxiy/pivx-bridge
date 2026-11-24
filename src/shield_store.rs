@@ -260,7 +260,8 @@ impl ShieldStore {
     pub fn hash_at(&self, height: u32) -> Result<Option<String>, String> {
         let r = self.db.begin_read().map_err(e)?;
         let t = r.open_table(HASHES).map_err(e)?;
-        Ok(t.get(height).map_err(e)?.map(|v| String::from_utf8_lossy(v.value()).into_owned()))
+        let v = t.get(height).map_err(e)?.map(|v| String::from_utf8_lossy(v.value()).into_owned());
+        Ok(v)
     }
 
     /// Stream offsets where the first block at or above `height` starts,

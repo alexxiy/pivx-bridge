@@ -379,10 +379,11 @@ impl Store {
     pub fn tip(&self) -> StoreResult<Option<u32>> {
         let r = self.db.begin_read().map_err(e)?;
         let meta = r.open_table(META).map_err(e)?;
-        Ok(meta
+        let v = meta
             .get("tip")
             .map_err(e)?
-            .map(|v| u32::from_le_bytes(v.value().try_into().unwrap_or([0; 4]))))
+            .map(|v| u32::from_le_bytes(v.value().try_into().unwrap_or([0; 4])));
+        Ok(v)
     }
 
     /// The chain indexed (`getblockchaininfo.chain`), once recorded. An
@@ -390,7 +391,8 @@ impl Store {
     pub fn chain(&self) -> StoreResult<Option<String>> {
         let r = self.db.begin_read().map_err(e)?;
         let meta = r.open_table(META).map_err(e)?;
-        Ok(meta.get("chain").map_err(e)?.map(|v| String::from_utf8_lossy(v.value()).into_owned()))
+        let v = meta.get("chain").map_err(e)?.map(|v| String::from_utf8_lossy(v.value()).into_owned());
+        Ok(v)
     }
 
     pub fn set_chain(&self, chain: &str) -> StoreResult<()> {
@@ -402,12 +404,13 @@ impl Store {
     pub fn block_info(&self, height: u32) -> StoreResult<Option<(String, u32)>> {
         let r = self.db.begin_read().map_err(e)?;
         let t = r.open_table(BLOCKS).map_err(e)?;
-        Ok(t.get(height).map_err(e)?.map(|v| {
+        let v = t.get(height).map_err(e)?.map(|v| {
             let b = v.value();
             let mut h = [0u8; 32];
             h.copy_from_slice(&b[..32]);
             (txid_to_hex(&h), u32::from_le_bytes(b[32..36].try_into().unwrap()))
-        }))
+        });
+        Ok(v)
     }
 
     pub fn begin_write(&self) -> StoreResult<WriteTransaction> {
@@ -640,7 +643,8 @@ impl Store {
     pub fn stats(&self, addr: &str) -> StoreResult<AddrStats> {
         let r = self.db.begin_read().map_err(e)?;
         let t = r.open_table(ADDR_STATS).map_err(e)?;
-        Ok(t.get(&addr_hash(addr)[..]).map_err(e)?.map(|v| AddrStats::decode(v.value())).unwrap_or_default())
+        let v = t.get(&addr_hash(addr)[..]).map_err(e)?.map(|v| AddrStats::decode(v.value())).unwrap_or_default();
+        Ok(v)
     }
 
     /// Whether each of `addrs` has confirmed history, in one read.
@@ -745,23 +749,26 @@ impl Store {
     pub fn output(&self, txid: &Txid, vout: u32) -> StoreResult<Option<StoredOut>> {
         let r = self.db.begin_read().map_err(e)?;
         let t = r.open_table(OUTS).map_err(e)?;
-        Ok(t.get(&outpoint_key(txid, vout)[..]).map_err(e)?.and_then(|v| StoredOut::decode(v.value())))
+        let v = t.get(&outpoint_key(txid, vout)[..]).map_err(e)?.and_then(|v| StoredOut::decode(v.value()));
+        Ok(v)
     }
 
     /// Whether `txid:vout` is still unspent (confirmed view).
     pub fn is_unspent(&self, txid: &Txid, vout: u32, any_addr: &str) -> StoreResult<bool> {
         let r = self.db.begin_read().map_err(e)?;
         let t = r.open_table(ADDR_UTXO).map_err(e)?;
-        Ok(t.get(&addr_utxo_key(&addr_hash(any_addr), txid, vout)[..]).map_err(e)?.is_some())
+        let v = t.get(&addr_utxo_key(&addr_hash(any_addr), txid, vout)[..]).map_err(e)?.is_some();
+        Ok(v)
     }
 
     pub fn tx_location(&self, txid: &Txid) -> StoreResult<Option<(u32, u32)>> {
         let r = self.db.begin_read().map_err(e)?;
         let t = r.open_table(TXS).map_err(e)?;
-        Ok(t.get(&txid[..]).map_err(e)?.map(|v| {
+        let v = t.get(&txid[..]).map_err(e)?.map(|v| {
             let b = v.value();
             (u32::from_le_bytes(b[..4].try_into().unwrap()), u32::from_le_bytes(b[4..8].try_into().unwrap()))
-        }))
+        });
+        Ok(v)
     }
 
     pub fn counts(&self) -> StoreResult<(u64, u64, u64)> {
